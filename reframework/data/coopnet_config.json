@@ -1,0 +1,10 @@
+{
+  "mode": "steam",
+  "bindHost": "127.0.0.1",
+  "localPort": 27777,
+  "peerHost": "127.0.0.1",
+  "peerPort": 27777,
+  "sendHz": 30,
+  "peerSteamId": "PUT_OTHER_PLAYERS_STEAMID64_HERE",
+  "steamChannel": 7
+}

@@ -1,0 +1,1594 @@
+-- coop_dummy.lua: spawn RE7's own VR dummy-player body (Prefab/System/VrDummyPlayer.pfb,
+-- held by app.vr.VrManager.DummyPlayerPrefab) 2 m from the player as a ghost
+-- candidate, label it, and log its full hierarchy and components.
+-- Log: <game>/reframework/data/coop_dummy_log.txt
+
+-- One log file per script load, so a Reset scripts doesn't wipe the last test.
+local lines = {}
+local LOG_FILE = "coop_dummy_log_" .. os.date("%H%M%S") .. ".txt"
+local function log(s)
+    lines[#lines + 1] = os.date("%H:%M:%S ") .. tostring(s)
+    local text = table.concat(lines, "\n")
+    fs.write(LOG_FILE, text)
+    fs.write("coop_dummy_log.txt", text)
+end
+
+local function safe(f, ...)
+    local ok, r = pcall(f, ...)
+    if ok then return r, nil end
+    return nil, r
+end
+
+local function get_player()
+    local om = sdk.get_managed_singleton("app.ObjectManager")
+    return om and om:get_field("PlayerObj")
+end
+
+-- Log a GameObject's components and recurse through its Transform children.
+local function dump_tree(go, depth, budget)
+    if budget.n <= 0 then return end
+    budget.n = budget.n - 1
+    local comps = {}
+    for _, c in ipairs((safe(function() return go:call("get_Components"):get_elements() end)) or {}) do
+        local tn = c:get_type_definition():get_full_name()
+        if tn == "via.render.Mesh" then
+            local h = safe(c.call, c, "getMesh")
+            tn = tn .. "[" .. tostring(h and safe(h.call, h, "get_ResourcePath")) ..
+                " ready=" .. tostring(safe(c.call, c, "get_ReadyToDraw")) .. "]"
+        end
+        comps[#comps + 1] = tn
+    end
+    log(string.rep("  ", depth) .. tostring(safe(go.call, go, "get_Name")) ..
+        " draw=" .. tostring(safe(go.call, go, "get_Draw")) .. " : " .. table.concat(comps, ", "))
+    local tr = safe(go.call, go, "get_Transform")
+    local child = tr and safe(tr.call, tr, "get_Child")
+    while child ~= nil and budget.n > 0 do
+        local cgo = safe(child.call, child, "get_GameObject")
+        if cgo then dump_tree(cgo, depth + 1, budget) end
+        child = safe(child.call, child, "get_Next")
+    end
+end
+
+-- Full-body model search ---------------------------------------------------
+-- Ethan's pl0001.mesh is only the first-person torso, so look for another
+-- character model: first among skinned meshes already in the scene, then by
+-- probing likely paths for every app.PlayerID.
+
+local prefab, dummy = nil, nil
+local dummy_mesh = nil
+local pose_err_logged = false
+
+local function resource_exists(rtype, path)
+    local r = safe(sdk.create_resource, rtype, path)
+    return r ~= nil, r
+end
+
+function find_full_model()
+    local found = {}
+    -- 1. skinned character meshes already in the scene
+    local sm = sdk.get_native_singleton("via.SceneManager")
+    local scene = sdk.call_native_func(sm, sdk.find_type_definition("via.SceneManager"), "get_CurrentScene")
+    local arr = scene and scene:call("findComponents(System.Type)", sdk.typeof("via.render.Mesh"))
+    local seen = {}
+    for _, m in ipairs((arr and arr:get_elements()) or {}) do
+        local h = safe(m.call, m, "getMesh")
+        local path = h and safe(h.call, h, "get_ResourcePath")
+        if path and not seen[path] and path:find("^Character/") and safe(m.call, m, "get_SkinningMesh") then
+            seen[path] = true
+            local mh = safe(m.call, m, "get_Material")
+            local mdf = mh and safe(mh.call, mh, "get_ResourcePath")
+            local owner = safe(m.call, m, "get_GameObject")
+            local oname = owner and tostring(safe(owner.call, owner, "get_Name")) or "?"
+            local otr = owner and safe(owner.call, owner, "get_Transform")
+            local rtr = otr
+            while rtr do
+                local p = safe(rtr.call, rtr, "get_Parent")
+                if p == nil then break end
+                rtr = p
+            end
+            local root = rtr and safe(rtr.call, rtr, "get_GameObject")
+            local rname = root and tostring(safe(root.call, root, "get_Name")) or "?"
+            local jarr = otr and safe(otr.call, otr, "get_Joints")
+            local jn = jarr and #(safe(jarr.get_elements, jarr) or {}) or 0
+            log(string.format("scene skinned character mesh: %s mdf=%s owner=%s root=%s joints=%d",
+                path, tostring(mdf), oname, rname, jn))
+            -- mh can be a live material with no file path (Mia's em2000 body), so
+            -- filter on the holder, not the path.
+            if not path:find("pl0001") and not path:find("_sim") and mh ~= nil then
+                -- Hold references: without add_ref the GC can free these holders
+                -- while we keep them, and setMesh on a stale holder crashed the
+                -- game (access violation, 2026-10-29 15:35).
+                safe(h.add_ref, h)
+                safe(mh.add_ref, mh)
+                found[#found + 1] = { mesh = path, mdf = mdf, from = "scene", holder = h, mholder = mh, comp = m }
+            end
+        end
+    end
+    -- Probing paths with sdk.create_resource is useless: it returns an object even
+    -- for files that don't exist (every guessed pl*.mesh "existed"). Scene only.
+    log("full-body candidates: " .. #found)
+    for i, f in ipairs(found) do log(string.format("  %d. %s mdf=%s", i, f.mesh, tostring(f.mdf))) end
+    return found
+end
+
+candidates = {}
+local copy_pose = false   -- Ethan's pose on another character's skeleton makes no sense
+
+-- Full-character assembly ----------------------------------------------------
+-- RE Engine characters are split into several meshes (head, body, hair...) on
+-- several GameObjects. Hand-built GameObjects don't render in RE7, but
+-- prefab-spawned dummies do, so spawn one VR dummy per mesh of the source
+-- character and keep them all at the same origin.
+
+local parts = {}            -- { go, mesh, holder, mholder, path, state }
+local parts_frames = 0
+
+-- Follow: replay the player's own path DELAY seconds behind. The recorded
+-- samples stand in for a remote player's packets until networking exists.
+local DELAY, KEEP = 3.0, 10.0
+TURN_TAU = 0.1          -- s; body facing eases toward the sender's (smaller = snappier)
+BLEND_DIR = 12          -- frames to blend between directions of the same stance
+BLEND_STANCE = 16       -- frames to blend walk/jog/crouch/stand changes
+MIN_HOLD = 0.3          -- s a moving clip plays before a direction change
+EXTRAPOLATE_MAX = 0.1   -- s to keep moving past the newest sample on a late packet
+LOOKAHEAD = 0.08        -- s of buffered future used to start/stop the walk on time
+MOVE_START, MOVE_STOP = 0.25, 0.15   -- m/s; separate thresholds so it doesn't toggle
+local follow = true
+local history = {}          -- { t, pos, rot }, oldest first
+
+local function record_player()
+    local player = get_player()
+    if player == nil then return end
+    local tr = player:call("get_Transform")
+    local now = os.clock()
+    history[#history + 1] = { t = now, pos = tr:call("get_Position"), rot = tr:call("get_Rotation") }
+    while #history > 0 and history[1].t < now - KEEP do table.remove(history, 1) end
+end
+
+local function sample_from(list, t)
+    for i = #list, 1, -1 do
+        if list[i].t <= t then return list[i] end
+    end
+    return nil
+end
+
+local function sample_at(t) return sample_from(history, t) end
+
+-- Interpolated sample at time t: lerp position and nlerp rotation between the
+-- two samples around t. Before the first sample or past the newest one (late or
+-- lost packets) it holds the nearest pose instead of snapping.
+local function sample_interp(list, t)
+    local n = #list
+    if n == 0 then return nil end
+    if t <= list[1].t then return list[1] end
+    if t >= list[n].t then
+        -- Late packet: keep moving at the last velocity for a short while instead
+        -- of freezing on the newest sample (that hold-then-jump read as choppy).
+        local last, prev = list[n], list[n - 1]
+        local over = math.min(t - last.t, EXTRAPOLATE_MAX)
+        if prev == nil or over <= 0 or last.t - prev.t < 1e-4 then return last end
+        local span = last.t - prev.t
+        local vx, vy, vz = (last.pos.x - prev.pos.x) / span, (last.pos.y - prev.pos.y) / span, (last.pos.z - prev.pos.z) / span
+        return { t = t, pos = Vector3f.new(last.pos.x + vx * over, last.pos.y + vy * over, last.pos.z + vz * over),
+            rot = last.rot, look_yaw = last.look_yaw, look_pitch = last.look_pitch, flags = last.flags }
+    end
+    local lo = 1
+    for i = n - 1, 1, -1 do
+        if list[i].t <= t then lo = i break end
+    end
+    local a, b = list[lo], list[lo + 1]
+    local span = b.t - a.t
+    local k = span > 1e-6 and (t - a.t) / span or 0
+    local pa, pb, qa, qb = a.pos, b.pos, a.rot, b.rot
+    local sign = (qa.x * qb.x + qa.y * qb.y + qa.z * qb.z + qa.w * qb.w) < 0 and -1 or 1
+    local qx, qy, qz, qw = qa.x + (qb.x * sign - qa.x) * k, qa.y + (qb.y * sign - qa.y) * k,
+        qa.z + (qb.z * sign - qa.z) * k, qa.w + (qb.w * sign - qa.w) * k
+    local len = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if len < 1e-6 then len = 1 end
+    return {
+        t = t,
+        pos = Vector3f.new(pa.x + (pb.x - pa.x) * k, pa.y + (pb.y - pa.y) * k, pa.z + (pb.z - pa.z) * k),
+        rot = Quaternion.new(qw / len, qx / len, qy / len, qz / len),
+        look_yaw = (a.look_yaw or 0) + ((b.look_yaw or 0) - (a.look_yaw or 0)) * k,
+        look_pitch = (a.look_pitch or 0) + ((b.look_pitch or 0) - (a.look_pitch or 0)) * k,
+        flags = (k < 0.5) and a.flags or b.flags,   -- discrete: take the nearer sample
+    }
+end
+
+-- Stance -----------------------------------------------------------------------
+-- Packed into the packet's animBank field: bit0 crouch, bit1 walking (vs jog),
+-- bit2 "flags present" (old senders and replay samples have none).
+STANCE_CROUCH, STANCE_WALK, STANCE_VALID = 1, 2, 4
+
+local function player_movement(player)
+    return player and safe(player.call, player, "getComponent(System.Type)", sdk.typeof("app.PlayerMovement"))
+end
+
+function local_stance_flags(player)
+    local pm = player_movement(player)
+    if pm == nil then return 0 end
+    local f = STANCE_VALID
+    if safe(pm.call, pm, "get_isCrouch") then f = f + STANCE_CROUCH end
+    if safe(pm.call, pm, "get_isWalk") then f = f + STANCE_WALK end
+    return f
+end
+
+-- Ethan's real move speeds (same game on both PCs), as playback references.
+function local_move_speeds()
+    local pm = player_movement(get_player())
+    if pm == nil then return nil end
+    return { walk = tonumber(safe(pm.get_field, pm, "WalkSpeed")), jog = tonumber(safe(pm.get_field, pm, "JogSpeed")),
+        crouch = tonumber(safe(pm.get_field, pm, "CrouchMoveSpeed")) }
+end
+
+-- Look direction ---------------------------------------------------------------
+-- Sender: camera yaw relative to the body, and pitch (radians). Characters face
+-- +Z (confirmed with the bot); which camera axis is "forward" is picked once as
+-- the one closest to the body's facing.
+
+local function qrot_v(q, x, y, z)
+    local tx, ty, tz = 2 * (q.y * z - q.z * y), 2 * (q.z * x - q.x * z), 2 * (q.x * y - q.y * x)
+    return x + q.w * tx + (q.y * tz - q.z * ty), y + q.w * ty + (q.z * tx - q.x * tz), z + q.w * tz + (q.x * ty - q.y * tx)
+end
+local function wrap(a) while a > math.pi do a = a - 2 * math.pi end while a < -math.pi do a = a + 2 * math.pi end return a end
+local cam_sign = nil
+
+function local_look(body_q)
+    local cam = sdk.get_primary_camera()
+    local cgo = cam and cam:call("get_GameObject")
+    local cq = cgo and cgo:call("get_Transform"):call("get_Rotation")
+    if cq == nil then return 0, 0 end
+    local bx, _, bz = qrot_v(body_q, 0, 0, 1)
+    local fx, fy, fz = qrot_v(cq, 0, 0, 1)
+    local body_yaw = math.atan(bx, bz)
+    if cam_sign == nil then
+        local d_pos = math.abs(wrap(math.atan(fx, fz) - body_yaw))
+        local d_neg = math.abs(wrap(math.atan(-fx, -fz) - body_yaw))
+        cam_sign = (d_neg < d_pos) and -1 or 1
+        log("look: camera forward is " .. (cam_sign > 0 and "+Z" or "-Z"))
+    end
+    fx, fy, fz = fx * cam_sign, fy * cam_sign, fz * cam_sign
+    return wrap(math.atan(fx, fz) - body_yaw), math.asin(math.max(-1, math.min(1, fy)))
+end
+
+-- Receiver: after animation, turn the ghost's neck and head toward the look.
+-- enabled=false: writing joint world rotations froze the Motion (walk frame stuck
+-- at 106.5, 2026-10-29 16:50) and the turns accumulated. Needs a Motion-side
+-- method (Motion.setLocalRotation per joint, or a constraint) before it's on.
+-- v1/v2 history is in NOTES.md; v3 (write at PrepareRendering) works, so on by default.
+local look = { yaw = 0, pitch = 0, joints = nil, err = false, enabled = true }
+
+local function qmul_l(a, b)
+    return {
+        x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+    }
+end
+
+local function axis_q(ax, ay, az, ang)
+    local s = math.sin(ang / 2)
+    return { x = ax * s, y = ay * s, z = az * s, w = math.cos(ang / 2) }
+end
+
+local function find_look_joints(tr)
+    local arr = safe(tr.call, tr, "get_Joints")
+    local elems = (arr and safe(arr.get_elements, arr)) or {}
+    local names, neck, head = {}, nil, nil
+    for _, j in ipairs(elems) do
+        local n = tostring(safe(j.call, j, "get_Name"))
+        names[#names + 1] = n
+        local ln = n:lower()
+        if neck == nil and ln:find("neck") then neck = j end
+        if head == nil and ln:find("head") and not ln:find("end") then head = j end
+    end
+    fs.write("coop_joints.txt", table.concat(names, "\n"))
+    log(string.format("look: %d joints; neck=%s head=%s", #names,
+        neck and tostring(neck:call("get_Name")) or "none", head and tostring(head:call("get_Name")) or "none"))
+    return { { neck, 0.4 }, { head, 0.6 } }
+end
+
+function apply_look(body_tr, body_q)
+    if look.joints == nil then look.joints = find_look_joints(body_tr) end
+    local yaw = math.max(-1.2, math.min(1.2, look.yaw))       -- about 70 degrees
+    local pitch = math.max(-0.7, math.min(0.7, look.pitch))   -- about 40 degrees
+    local rx, ry, rz = qrot_v(body_q, 1, 0, 0)                -- body's right axis
+    for _, e in ipairs(look.joints) do
+        local j, share = e[1], e[2]
+        if j then
+            local r = j:call("get_Rotation")
+            local d = qmul_l(axis_q(0, 1, 0, yaw * share), axis_q(rx, ry, rz, -pitch * share))
+            local n = qmul_l(d, { x = r.x, y = r.y, z = r.z, w = r.w })
+            j:call("set_Rotation", Quaternion.new(n.w, n.x, n.y, n.z))
+        end
+    end
+end
+
+-- Network bridge -------------------------------------------------------------
+-- CoopNet.cs (REFramework C# plugin) moves samples over UDP. Lua writes the
+-- local player's state to coopnet_out.txt and reads the peer's samples from
+-- coopnet_in.txt ("seq t px py pz qx qy qz qw bank id frame" per line).
+
+local net = {
+    enabled = true,         -- co-op mode: the ghost follows the other player by default
+    delay = 0.15,           -- live; use 3 s for the echo test (visible trail)
+    last_io = 0, last_status = 0,
+    seq = 0, last_in_seq = -1,
+    offset = nil,           -- local clock - sender clock (minimum seen)
+    history = {},
+    stats = "no status yet",
+}
+
+local function net_io()
+    if not net.enabled then return end
+    local now = os.clock()
+    if now - net.last_io < 1 / 30 then return end
+    net.last_io = now
+
+    local player = get_player()
+    if player then
+        local tr = player:call("get_Transform")
+        local p, q = tr:call("get_Position"), tr:call("get_Rotation")
+        local ly, lp = local_look(q)
+        net.seq = net.seq + 1
+        fs.write("coopnet_out.txt", string.format("%d %.4f %.5f %.5f %.5f %.6f %.6f %.6f %.6f %d 0 0 %.4f %.4f\n",
+            net.seq, now, p.x, p.y, p.z, q.x, q.y, q.z, q.w, local_stance_flags(player), ly, lp))
+    end
+
+    if fs.read == nil then
+        if not net.no_read then net.no_read = true log("net: fs.read is not available in this REFramework build") end
+        return
+    end
+    local text = fs.read("coopnet_in.txt")
+    if text then
+        for line in text:gmatch("[^\r\n]+") do
+            local v = {}
+            for num in line:gmatch("%S+") do v[#v + 1] = tonumber(num) end
+            if #v >= 14 then
+                local seq, t = v[1], v[2]
+                if seq < net.last_in_seq - 1000 then net.last_in_seq = -1 end  -- peer restarted
+                if seq > net.last_in_seq then
+                    net.last_in_seq = seq
+                    local off = now - t
+                    if net.offset == nil or off < net.offset then net.offset = off end
+                    net.history[#net.history + 1] = { t = t + net.offset,
+                        pos = Vector3f.new(v[3], v[4], v[5]), rot = Quaternion.new(v[9], v[6], v[7], v[8]),
+                        flags = math.floor(v[10]), look_yaw = v[13], look_pitch = v[14] }
+                end
+            end
+        end
+        while #net.history > 0 and net.history[1].t < now - KEEP do table.remove(net.history, 1) end
+    end
+
+    if now - net.last_status > 1 then
+        net.last_status = now
+        local st = fs.read("coopnet_status.txt")
+        if st then net.stats = st:gsub("\n", "  ") end
+    end
+end
+
+local function root_of(go)
+    local tr = go:call("get_Transform")
+    while true do
+        local p = safe(tr.call, tr, "get_Parent")
+        if p == nil then break end
+        tr = p
+    end
+    return tr:call("get_GameObject")
+end
+
+-- Quaternion helpers (x, y, z, w tables or REFramework quats).
+local function qconj(q) return { x = -q.x, y = -q.y, z = -q.z, w = q.w } end
+local function qmul(a, b)
+    return {
+        x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+        w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+    }
+end
+local function qrot(q, v)
+    local r = qmul(qmul(q, { x = v.x, y = v.y, z = v.z, w = 0 }), qconj(q))
+    return { x = r.x, y = r.y, z = r.z }
+end
+
+-- Offset of a piece relative to the character root, in root space, so pieces
+-- parented to joints (heads on the neck) land in the right place.
+local function local_offset(root, go)
+    local rtr, tr = root:call("get_Transform"), go:call("get_Transform")
+    local rp, rq = rtr:call("get_Position"), rtr:call("get_Rotation")
+    local p, q = tr:call("get_Position"), tr:call("get_Rotation")
+    local inv = qconj({ x = rq.x, y = rq.y, z = rq.z, w = rq.w })
+    local off = qrot(inv, { x = p.x - rp.x, y = p.y - rp.y, z = p.z - rp.z })
+    local rot = qmul(inv, { x = q.x, y = q.y, z = q.z, w = q.w })
+    return off, rot
+end
+
+local function meshes_under(go, out, depth)
+    out = out or {}
+    depth = depth or 0
+    if depth > 12 then return out end
+    local m = safe(go.call, go, "getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
+    if m then
+        local h = safe(m.call, m, "getMesh")
+        local mh = safe(m.call, m, "get_Material")
+        if h and mh then
+            safe(h.add_ref, h)
+            safe(mh.add_ref, mh)
+            -- Meshes hold variants as parts (e.g. Mia's normal vs infected head), so
+            -- copy the source's on/off pattern instead of enabling everything.
+            local n = tonumber(safe(m.call, m, "getPartsEnableCount") or 0) or 0
+            local mask = {}
+            for i = 0, n - 1 do mask[i] = safe(m.call, m, "getPartsEnable", i) and true or false end
+            local tr = go:call("get_Transform")
+            out[#out + 1] = { holder = h, mholder = mh, path = tostring(safe(h.call, h, "get_ResourcePath")),
+                owner = tostring(safe(go.call, go, "get_Name")), mask = mask, mask_n = n, src = m, go = go,
+                same_joints = safe(tr.call, tr, "get_SameJointsConstraint"),
+                parent_joint = safe(tr.call, tr, "get_ParentJoint"),
+                is_root = depth == 0 }
+        end
+    end
+    local tr = go:call("get_Transform")
+    local child = safe(tr.call, tr, "get_Child")
+    while child ~= nil do
+        local cgo = safe(child.call, child, "get_GameObject")
+        if cgo then meshes_under(cgo, out, depth + 1) end
+        child = safe(child.call, child, "get_Next")
+    end
+    return out
+end
+
+-- Animation ------------------------------------------------------------------
+-- Borrow the scene character's own motion bank (its clips on its skeleton) for
+-- the body piece, list the clips, and play walk/idle on layer 0.
+
+local anim = {
+    src_root = nil,      -- scene character root GameObject
+    motion = nil,        -- our body piece's via.motion.Motion
+    clips = {},          -- { bank, id, name, frames }
+    walk = nil, idle = nil,
+    auto = false,
+    playing = nil,
+    change = nil,        -- TreeLayer.changeMotion method found at runtime
+    ready = false,
+    walk_ref = 0.8,      -- m/s the walk clip looks right at (owner-tuned with the bot, 2026-10-29)
+    speed = 0, rate = 1,
+}
+
+local function dump_methods(tname, file)
+    local t = sdk.find_type_definition(tname)
+    if t == nil then return end
+    local out = {}
+    for _, m in ipairs(t:get_methods() or {}) do
+        local ps = {}
+        for _, p in ipairs(m:get_param_types() or {}) do ps[#ps + 1] = p:get_full_name() end
+        out[#out + 1] = m:get_name() .. "(" .. table.concat(ps, ", ") .. ")"
+    end
+    fs.write(file, table.concat(out, "\n"))
+end
+
+local function find_change_motion()
+    local t = sdk.find_type_definition("via.motion.TreeLayer")
+    local best = nil
+    for _, m in ipairs((t and t:get_methods()) or {}) do
+        if m:get_name() == "changeMotion" then
+            local ps = m:get_param_types() or {}
+            local sig = {}
+            for _, p in ipairs(ps) do sig[#sig + 1] = p:get_full_name() end
+            log("TreeLayer.changeMotion(" .. table.concat(sig, ", ") .. ")")
+            -- prefer (bank, id, startFrame, interpFrame, mode, curve)
+            if #ps == 6 and sig[1] == "System.UInt32" and sig[2] == "System.UInt32" then best = m end
+            if best == nil and #ps >= 4 and sig[1] == "System.UInt32" then best = m end
+        end
+    end
+    return best
+end
+
+local function list_clips(motion)
+    local clips, out = {}, {}
+    local info = safe(sdk.create_instance, "via.motion.MotionInfo")
+    if info then safe(info.add_ref, info) end
+    local nb = tonumber(safe(motion.call, motion, "getActiveMotionBankCount") or 0) or 0
+    for b = 0, nb - 1 do
+        local bank = safe(motion.call, motion, "getActiveMotionBank", b)
+        local bid = bank and safe(bank.call, bank, "get_BankID")
+        local bname = bank and safe(bank.call, bank, "get_Name")
+        local n = bid and tonumber(safe(motion.call, motion, "getMotionCount", bid) or 0) or 0
+        out[#out + 1] = string.format("bank %s id=%s name=%s motions=%d", tostring(b), tostring(bid), tostring(bname), n)
+        for i = 0, n - 1 do
+            local ok = info and safe(motion.call, motion, "getMotionInfoByIndex(System.UInt32, System.UInt32, via.motion.MotionInfo)", bid, i, info)
+            if ok then
+                local c = { bank = bid, id = safe(info.call, info, "get_MotionID"),
+                    name = tostring(safe(info.call, info, "get_MotionName")),
+                    frames = safe(info.call, info, "get_MotionEndFrame") }
+                clips[#clips + 1] = c
+                out[#out + 1] = string.format("  [%s/%s] %s (%s frames)", tostring(c.bank), tostring(c.id), c.name, tostring(c.frames))
+            end
+        end
+    end
+    fs.write("coop_motions.txt", table.concat(out, "\n"))
+    log(string.format("animation: %d banks, %d clips listed (coop_motions.txt)", nb, #clips))
+    return clips
+end
+
+anim_from_player = false
+
+function setup_animation(body_part)
+    if anim.src_root == nil or body_part == nil then return end
+    local src = anim_from_player and get_player() or anim.src_root
+    if anim_from_player then log("animation: using the player's own Motion (Ethan skeleton)") end
+    local src_motion = safe(src.call, src, "getComponent(System.Type)", sdk.typeof("via.motion.Motion"))
+    if src_motion == nil then log("animation: scene character has no via.motion.Motion") return end
+    dump_methods("via.motion.TreeLayer", "coop_treelayer_api.txt")
+
+    local go = body_part.go
+    local motion = go:call("getComponent(System.Type)", sdk.typeof("via.motion.Motion"))
+    local function counts(stage)
+        log(string.format("animation %s: layers=%s activeBanks=%s banks=%s dynBanks=%s jointsConstructed=%s joints=%s",
+            stage, tostring(safe(motion.call, motion, "getLayerCount")),
+            tostring(safe(motion.call, motion, "getActiveMotionBankCount")),
+            tostring(safe(motion.call, motion, "getMotionBankCount")),
+            tostring(safe(motion.call, motion, "getDynamicMotionBankCount")),
+            tostring(safe(motion.call, motion, "get_JointsConstructed")),
+            tostring(safe(motion.call, motion, "get_JointCount"))))
+        local l0 = safe(motion.call, motion, "getLayer", 0)
+        if l0 then
+            log(string.format("  layer0 bank=%s motion=%s frame=%s end=%s",
+                tostring(safe(l0.call, l0, "get_MotionBankID")), tostring(safe(l0.call, l0, "get_MotionID")),
+                tostring(safe(l0.call, l0, "get_Frame")), tostring(safe(l0.call, l0, "get_EndFrame"))))
+        end
+    end
+    counts("before swap")
+    -- Keep the dummy's MotionFsm running for now: it owns the layers. It gets
+    -- disabled in play_clip only once a clip is actually bound to a layer.
+    anim.fsm_components = {}
+    for _, tn in ipairs({ "via.motion.MotionFsm", "app.MotionManager", "app.SequenceController", "app.EventActionController" }) do
+        local c = safe(go.call, go, "getComponent(System.Type)", sdk.typeof(tn))
+        if c then anim.fsm_components[#anim.fsm_components + 1] = c end
+    end
+    anim.counts = counts
+    local bank_asset = safe(src_motion.call, src_motion, "get_MotionBankAsset")
+    local jmap = safe(src_motion.call, src_motion, "get_JointMap")
+    log("animation: scene bank asset " .. tostring(bank_asset and safe(bank_asset.call, bank_asset, "get_ResourcePath")) ..
+        ", joint map " .. tostring(jmap and safe(jmap.call, jmap, "get_ResourcePath")))
+    if bank_asset then
+        safe(bank_asset.add_ref, bank_asset)
+        local _, err = safe(motion.call, motion, "set_MotionBankAsset", bank_asset)
+        if err then log("animation: set_MotionBankAsset ERR " .. tostring(err)) end
+    end
+    counts("after set_MotionBankAsset")
+    if jmap then safe(jmap.add_ref, jmap) safe(motion.call, motion, "set_JointMap", jmap) end
+    safe(motion.call, motion, "setupMotionBank")
+    counts("after setupMotionBank")
+    anim.motion = motion
+    anim.change = find_change_motion()
+    -- The scene character is inactive and has no active banks; list from our own
+    -- Motion once the borrowed bank has loaded (async), retrying in poll_clips().
+    anim.poll_until = os.clock() + 20
+    anim.next_poll = os.clock() + 1
+    anim.ready = true
+end
+
+local function poll_clips()
+    if not anim.ready or anim.poll_until == nil or #anim.clips > 0 then return end
+    local now = os.clock()
+    if now < anim.next_poll then return end
+    anim.next_poll = now + 1
+    local nb = tonumber(safe(anim.motion.call, anim.motion, "getActiveMotionBankCount") or 0) or 0
+    local nall = tonumber(safe(anim.motion.call, anim.motion, "getMotionBankCount") or 0) or 0
+    log(string.format("animation poll: active banks=%d, banks=%d", nb, nall))
+    if nb > 0 then
+        anim.clips = list_clips(anim.motion)
+        anim.poll_until = nil
+        -- Without a playing clip the skeleton never updates and the body stays
+        -- frozen while its transform moves. Pick walk/idle by name and start now.
+        -- Ethan's bank has a full locomotion set; pick it by exact name. Otherwise
+        -- (Mia) fall back to the first walk/idle-looking names.
+        local by_name = {}
+        for _, c in ipairs(anim.clips) do if by_name[c.name] == nil then by_name[c.name] = c end end
+        local set = {
+            fwd = by_name["pl0000_Hands_Walk_Loop"], back = by_name["pl0000_Hands_WalkB_Loop"],
+            left = by_name["pl0000_Hands_WalkL_Loop"], right = by_name["pl0000_Hands_WalkR_Loop"],
+            jfwd = by_name["pl0000_Hands_Jog_Loop"], jback = by_name["pl0000_Hands_JogB_Loop"],
+            jleft = by_name["pl0000_Hands_JogL_Loop"], jright = by_name["pl0000_Hands_JogR_Loop"],
+            cfwd = by_name["pl0000_Hands_WalkCrouch_Loop"], cback = by_name["pl0000_Hands_WalkCrouchB_Loop"],
+            cleft = by_name["pl0000_Hands_WalkCrouchL_Loop"], cright = by_name["pl0000_Hands_WalkCrouchR_Loop"],
+            cidle = by_name["pl0000_Hands_Crouch_Loop"],
+            -- Not Stand_Loop: it never binds and jams the layer (18:50, 19:09), and
+            -- as the first clip of a fresh ghost it leaves him T-posed for good.
+            idle = by_name["pl0000_Hands_StandDamage_Loop"] or by_name["pl0000_Hands_Stand_Loop"],
+        }
+        anim.bad = anim.bad or {}
+        anim.bad["pl0000_Hands_Stand_Loop"] = true
+        if set.fwd and set.idle then
+            anim.set, anim.walk, anim.idle = set, set.fwd, set.idle
+            anim.walk_ref, anim.jog_ref, anim.crouch_ref = 1.3, 3.2, 0.9
+            local sp = local_move_speeds()
+            if sp and sp.walk and sp.walk > 0 then
+                anim.walk_ref, anim.jog_ref = sp.walk, sp.jog or anim.jog_ref
+                anim.crouch_ref = sp.crouch or anim.crouch_ref
+            end
+            log(string.format("animation: Ethan locomotion set (walk/jog/crouch x 4 + stand/crouch idle); refs walk %.2f jog %.2f crouch %.2f m/s",
+                anim.walk_ref, anim.jog_ref, anim.crouch_ref))
+        end
+        for _, c in ipairs(anim.clips) do
+            local ln = c.name:lower()
+            if anim.walk == nil and ln:find("walk") then anim.walk = c end
+            if anim.idle == nil and (ln:find("idle") or ln:find("wait")) then anim.idle = c end
+        end
+        log("animation: auto-picked walk=" .. (anim.walk and anim.walk.name or "none") ..
+            " idle=" .. (anim.idle and anim.idle.name or "none"))
+        -- Start on the known-good forward walk so the fresh layer binds a clip
+        -- first; Auto switches to the idle on its next check.
+        local first = anim.walk or anim.idle or anim.clips[1]
+        if first then play_clip(first) end
+        anim.auto = (anim.walk ~= nil)
+    elseif now > anim.poll_until then
+        log("animation: banks never became active on the ghost")
+        anim.poll_until = nil
+    end
+end
+
+-- Fresh, constructed layer on slot 0 (a jammed layer ignores later clips).
+function rebuild_layer()
+    local tl = safe(sdk.create_instance, "via.motion.TreeLayer")
+    if tl == nil then log("rebuild_layer: create_instance failed") return end
+    safe(tl.add_ref, tl)
+    safe(tl.call, tl, ".ctor")
+    safe(anim.motion.call, anim.motion, "setLayerCount", 1)
+    local _, err = safe(anim.motion.call, anim.motion, "setLayer", 0, tl)
+    log("rebuild_layer: new TreeLayer on slot 0" .. (err and (" ERR " .. tostring(err)) or ""))
+end
+
+-- Fallback idles once a clip has been retired as bad.
+local IDLE_FALLBACKS = { "pl0000_Hands_Stand_Loop", "pl0000_Hands_StandDamage_Loop", "pl0000_E-Radar_Stand_Loop" }
+function next_idle()
+    for _, name in ipairs(IDLE_FALLBACKS) do
+        if not (anim.bad and anim.bad[name]) then
+            for _, c in ipairs(anim.clips) do
+                if c.name == name then log("idle fallback -> " .. name) return c end
+            end
+        end
+    end
+    -- Last resort: the forward walk held still at its first frame.
+    log("idle fallback -> walk held at frame 0")
+    anim.idle_hold = true
+    return anim.set and anim.set.fwd or anim.walk
+end
+
+function play_clip(c)
+    if not anim.ready or anim.change == nil then log("play: animation not ready") return end
+    local layer = safe(anim.motion.call, anim.motion, "getLayer", 0)
+    if layer == nil then
+        -- Disabling the dummy's MotionFsm leaves the Motion with no layers;
+        -- setLayerCount creates them.
+        local before = safe(anim.motion.call, anim.motion, "getLayerCount")
+        local _, err = safe(anim.motion.call, anim.motion, "setLayerCount", 1)
+        layer = safe(anim.motion.call, anim.motion, "getLayer", 0)
+        log(string.format("play: layer count %s -> setLayerCount(1)%s -> layer0 %s", tostring(before),
+            err and (" ERR " .. tostring(err)) or "", layer and "ok" or "still missing"))
+        if layer == nil then
+            -- Recipe from EMV Engine (alphaZomega): construct the TreeLayer, then
+            -- setLayerCount + setLayer. Without .ctor the clip never binds (end=0).
+            local tl, cerr = safe(sdk.create_instance, "via.motion.TreeLayer")
+            if tl then
+                safe(tl.add_ref, tl)
+                local ctor_ok = safe(tl.call, tl, ".ctor")
+                log("play: TreeLayer .ctor -> " .. tostring(ctor_ok))
+                safe(anim.motion.call, anim.motion, "setLayerCount", 1)
+                local _, serr = safe(anim.motion.call, anim.motion, "setLayer", 0, tl)
+                layer = safe(anim.motion.call, anim.motion, "getLayer", 0)
+                log("play: created TreeLayer + setLayer(0)" .. (serr and (" ERR " .. tostring(serr)) or "") ..
+                    " -> layer0 " .. (layer and "ok" or "still missing"))
+            else
+                log("play: create_instance(via.motion.TreeLayer) failed: " .. tostring(cerr))
+            end
+        end
+        if layer == nil then return end
+    end
+    -- A motion-tree resource on the layer overrides direct clips; clear it.
+    safe(layer.call, layer, "set_Resource", nil)
+    local n = #(anim.change:get_param_types() or {})
+    local ok, err
+    if n == 6 then
+        ok, err = pcall(anim.change.call, anim.change, layer, c.bank, c.id, 0.0, anim.next_blend or BLEND_DIR, 2, 0)
+    else
+        ok, err = pcall(anim.change.call, anim.change, layer, c.bank, c.id, 0.0, anim.next_blend or BLEND_DIR)
+    end
+    safe(layer.call, layer, "set_Speed", 1.0)
+    safe(anim.motion.call, anim.motion, "set_Enabled", true)
+    anim.playing = c
+    anim.verify_at = os.clock() + 1.0
+    log("play " .. c.name .. " [" .. tostring(c.bank) .. "/" .. tostring(c.id) .. "]: " .. (ok and "ok" or ("ERR " .. tostring(err))))
+end
+
+-- One second after a play, record what layer 0 is actually doing. If the clip
+-- is bound (end frame > 0), stop the dummy's FSM so it can't override us.
+local function verify_playback()
+    if anim.verify_at == nil or os.clock() < anim.verify_at then return end
+    anim.verify_at = nil
+    local layer = safe(anim.motion.call, anim.motion, "getLayer", 0)
+    if layer == nil then log("verify: no layer 0") return end
+    local endf = tonumber(safe(layer.call, layer, "get_EndFrame") or 0) or 0
+    local fr = tonumber(safe(layer.call, layer, "get_Frame") or 0) or 0
+    local frozen = anim.last_verify_frame and math.abs(fr - anim.last_verify_frame) < 1e-4
+    anim.last_verify_frame = fr
+    -- Ethan's Stand_Loop never binds (end frame stays at the previous clip's) and
+    -- jams the layer for good (2026-10-29 18:50). Detect a bad bind or a stuck
+    -- frame, rebuild the layer, retire the clip, and move to a fallback idle.
+    local want_end = anim.playing and tonumber(anim.playing.frames or 0) or 0
+    local wrong_end = want_end > 0 and endf > 0 and math.abs(endf - want_end) > 0.5
+    -- (Head look v3 is proven safe, so a freeze no longer switches it off.)
+    if (frozen or wrong_end) and anim.playing then
+        local bad = anim.playing
+        -- Several rebuilds in a row that still don't bind: rebuild the whole ghost.
+        anim.fail_streak = (anim.fail_streak or 0) + 1
+        if anim.fail_streak >= 3 and os.clock() - (anim.last_full_rebuild or -100) > 30 then
+            anim.last_full_rebuild = os.clock()
+            anim.fail_streak = 0
+            log("verify: layer rebuilds keep failing; rebuilding the whole Ethan ghost")
+            local ok, err = pcall(build_ethan)
+            if not ok then log("full rebuild ERR " .. tostring(err)) end
+            return
+        end
+        log(string.format("verify: %s on %s (end=%s, want %s), rebuilding layer",
+            frozen and "FROZEN" or "WRONG BIND", bad.name, tostring(endf), tostring(want_end)))
+        anim.bad = anim.bad or {}
+        anim.bad[bad.name] = true
+        rebuild_layer()
+        local was_idle = (bad == anim.idle)
+        if was_idle then anim.idle = next_idle() end
+        anim.last_verify_frame = nil
+        play_clip(was_idle and (anim.idle or bad) or bad)
+        return
+    end
+    log(string.format("verify: layer0 bank=%s motion=%s frame=%s speed=%s end=%s; Motion enabled=%s",
+        tostring(safe(layer.call, layer, "get_MotionBankID")), tostring(safe(layer.call, layer, "get_MotionID")),
+        tostring(safe(layer.call, layer, "get_Frame")), tostring(safe(layer.call, layer, "get_Speed")),
+        tostring(endf), tostring(safe(anim.motion.call, anim.motion, "get_Enabled"))))
+    if anim.counts then anim.counts("at verify") end
+    -- A fresh layer sometimes doesn't bind the first clip; retry a few times.
+    if endf <= 0 and anim.playing and (anim.retries or 0) < 3 then
+        anim.retries = (anim.retries or 0) + 1
+        log("verify: clip not bound, retry " .. anim.retries)
+        play_clip(anim.playing)
+        anim.verify_at = os.clock() + 0.5
+        return
+    end
+    -- Fallback: re-add the active banks' motion lists as DynamicMotionBanks with
+    -- the same bank ids (EMV Engine's way of adding clips), then retry once.
+    if endf <= 0 and not anim.dyn_tried and anim.playing then
+        anim.dyn_tried = true
+        local m = anim.motion
+        local nb = tonumber(safe(m.call, m, "getActiveMotionBankCount") or 0) or 0
+        local added = 0
+        for b = 0, nb - 1 do
+            local bank = safe(m.call, m, "getActiveMotionBank", b)
+            local list = bank and safe(bank.call, bank, "get_MotionList")
+            local bid = bank and safe(bank.call, bank, "get_BankID")
+            if list then
+                local db = safe(sdk.create_instance, "via.motion.DynamicMotionBank")
+                if db then
+                    safe(db.add_ref, db)
+                    safe(db.call, db, ".ctor")
+                    safe(db.call, db, "set_MotionList", list)
+                    safe(db.call, db, "set_OverwriteBankID", true)
+                    safe(db.call, db, "set_BankID", bid)
+                    local count = tonumber(safe(m.call, m, "getDynamicMotionBankCount") or 0) or 0
+                    safe(m.call, m, "setDynamicMotionBankCount", count + 1)
+                    safe(m.call, m, "setDynamicMotionBank", count, db)
+                    added = added + 1
+                end
+            end
+        end
+        log("verify: clip not bound; added " .. added .. " DynamicMotionBank(s), retrying " .. anim.playing.name)
+        play_clip(anim.playing)
+        return
+    end
+    if endf > 0 then
+        anim.retries = 0
+        anim.fail_streak = 0
+        -- Leave the dummy's MotionFsm/app.MotionManager enabled: disabling them
+        -- froze the layer (frame stuck at 0.2889 for 13 s, 2026-10-29 16:17).
+        -- In RE7 app.MotionManager drives the Motion update.
+    end
+end
+
+-- Auto: pick walk or idle from how fast the ghost moved over the last 0.25 s.
+local last_auto = { t = 0, pos = nil }
+local function auto_animate(anchor, anchor_rot)
+    if not anim.auto or anchor == nil then return end
+    local now = os.clock()
+    if now - last_auto.t < 0.1 then return end   -- was 0.25: felt laggy starting to move
+    local vx, vz, speed = 0, 0, 0
+    if anim.vel then
+        vx, vz = anim.vel.x, anim.vel.z         -- look-ahead velocity from the buffer
+    elseif last_auto.pos then
+        local dt = now - last_auto.t
+        vx, vz = (anchor.x - last_auto.pos.x) / dt, (anchor.z - last_auto.pos.z) / dt
+    end
+    speed = math.sqrt(vx * vx + vz * vz)
+    last_auto.t, last_auto.pos = now, { x = anchor.x, z = anchor.z }
+    -- Light smoothing so one jittery sample doesn't flip walk/idle.
+    anim.speed = (anim.speed or 0) * 0.3 + speed * 0.7
+    -- Start and stop at different speeds so it doesn't toggle around one value.
+    local moving_now = anim.moving and (anim.speed > MOVE_STOP) or (anim.speed > MOVE_START)
+    anim.moving = moving_now
+
+    -- Stance from the sender's flags when present; otherwise infer jog from speed.
+    local f = anim.flags or 0
+    local has = (f & STANCE_VALID) ~= 0
+    local crouch = has and (f & STANCE_CROUCH) ~= 0
+    local s = anim.set
+    local still_clip = (crouch and s and s.cidle and not (anim.bad and anim.bad[s.cidle.name])) and s.cidle or anim.idle
+    local want, ref = still_clip, anim.walk_ref
+    if anim.moving then
+        want = anim.walk
+        if s and anchor_rot then
+            -- Direction of travel relative to facing: characters face +Z, so the
+            -- right-hand side is -X in local space.
+            local q = { x = anchor_rot.x, y = anchor_rot.y, z = anchor_rot.z, w = anchor_rot.w }
+            local fx, _, fz = qrot_v(q, 0, 0, 1)
+            local rx, _, rz = qrot_v(q, -1, 0, 0)
+            local fwd, side = vx * fx + vz * fz, vx * rx + vz * rz
+            local jog = (has and not crouch and (f & STANCE_WALK) == 0) or (not has and anim.speed > 2.2)
+            local pick = crouch and { s.cfwd, s.cback, s.cleft, s.cright }
+                or jog and { s.jfwd, s.jback, s.jleft, s.jright }
+                or { s.fwd, s.back, s.left, s.right }
+            local cand = (math.abs(fwd) >= math.abs(side)) and (fwd >= 0 and "fwd" or "back")
+                or (side >= 0 and "right" or "left")
+            -- Hysteresis: near a diagonal, keep the current direction unless the
+            -- new axis clearly dominates (25% margin).
+            local old = anim.dir
+            if old and old ~= cand and old ~= "-" then
+                local old_axis = (old == "fwd" or old == "back") and math.abs(fwd) or math.abs(side)
+                local new_axis = (cand == "fwd" or cand == "back") and math.abs(fwd) or math.abs(side)
+                if new_axis < old_axis * 1.25 then cand = old end
+            end
+            local idx = { fwd = 1, back = 2, left = 3, right = 4 }
+            want = pick[idx[cand]] or s.fwd
+            ref = crouch and anim.crouch_ref or jog and anim.jog_ref or anim.walk_ref
+            anim.dir = cand
+            anim.stance = crouch and "crouch" or jog and "jog" or "walk"
+        end
+    else
+        anim.stance = crouch and "crouch" or "stand"
+        anim.dir = "-"
+    end
+    -- Blend longer across stance changes than between directions, and give a
+    -- moving clip a minimum hold so diagonals don't flicker.
+    if want and anim.playing ~= want then
+        local stance_changed = anim.stance ~= anim.last_stance
+        local held = os.clock() - (anim.clip_t or 0)
+        if stance_changed or held >= MIN_HOLD then
+            anim.next_blend = stance_changed and BLEND_STANCE or BLEND_DIR
+            play_clip(want)
+            anim.clip_t = os.clock()
+            anim.last_stance = anim.stance
+        end
+    end
+    -- Last-resort idle is the walk clip held still.
+    if want == anim.idle and anim.idle_hold then
+        local layer = safe(anim.motion.call, anim.motion, "getLayer", 0)
+        if layer then safe(layer.call, layer, "set_Speed", 0.0) end
+    end
+    -- Match the cycle to how fast the ghost actually moves (no foot sliding).
+    if want ~= anim.idle and want ~= still_clip and anim.playing == want then
+        local layer = safe(anim.motion.call, anim.motion, "getLayer", 0)
+        local target = math.max(0.5, math.min(2.0, anim.speed / ref))
+        -- Ease the stride rate too; jumping it every 0.1 s looked choppy.
+        local rate = (anim.rate or target) * 0.7 + target * 0.3
+        if layer then safe(layer.call, layer, "set_Speed", rate) end
+        anim.rate = rate
+    end
+end
+
+-- Build the co-op ghost as Ethan. His extra meshes all hang off the player
+-- object; assembling from any of them collects the player's Shadow set (the
+-- full-body Ethan RE7 renders only for his shadow), animated with the
+-- player's own motion bank. Ethan's first-person view hides parts like the
+-- head on the source, so every part is shown on the ghost.
+function build_ethan()
+    for _, c in ipairs(candidates) do
+        if c.mesh:find("Player/pl0000") then
+            local owner = safe(c.comp.call, c.comp, "get_GameObject")
+            local root = owner and root_of(owner)
+            -- skip standalone event props (e.g. sm1649_EthanLHand_Event)
+            local player = get_player()
+            if root and player and root:get_address() == player:get_address() then
+                parts_mode = "all"
+                anim_from_player = true
+                log("build Ethan from " .. c.mesh)
+                assemble_from(c)
+                return
+            end
+        end
+    end
+    log("build Ethan: no Ethan mesh on the player object (is the player loaded?)")
+end
+
+function assemble_from(c)
+    local src_go = c.comp:call("get_GameObject")
+    local root = root_of(src_go)
+    anim.src_root = root
+    log("assemble: source mesh owner '" .. tostring(src_go:call("get_Name")) ..
+        "', root '" .. tostring(root:call("get_Name")) .. "'")
+    -- Replace any previous ghost instead of stacking a second one on top.
+    local destroy = sdk.find_type_definition("via.GameObject"):get_method("destroy(via.GameObject)")
+    for _, old in ipairs(parts) do pcall(destroy.call, destroy, nil, old.go) end
+    parts = {}
+    anim.clips, anim.playing, anim.walk, anim.idle, anim.set, anim.retries = {}, nil, nil, nil, nil, 0
+
+    local list = meshes_under(root)
+    log("assemble: " .. #list .. " meshes under root")
+    if anim_from_player then
+        -- Ethan: the player object also holds his first-person body, props, the
+        -- molded-arm attachments and a full "Shadow" copy RE7 renders only for his
+        -- shadow. The Shadow set is the complete third-person Ethan; use only it,
+        -- with ShadowBody as the root whose skeleton the other pieces borrow.
+        local shadow = {}
+        for _, e in ipairs(list) do
+            if e.owner:find("^Shadow") then
+                e.is_root = (e.owner == "ShadowBody")
+                if not e.is_root then e.same_joints = true end
+                shadow[#shadow + 1] = e
+            end
+        end
+        if #shadow > 0 then
+            list = shadow
+            log("assemble: Ethan uses " .. #shadow .. " Shadow* pieces")
+        end
+    end
+    local p = get_player():call("get_Transform"):call("get_Position")
+    for _, e in ipairs(list) do
+        if not e.path:find("_sim") then
+            local go = safe(prefab.call, prefab, "instantiate(via.vec3)", Vector3f.new(p.x + 1.5, p.y, p.z))
+            if go then
+                local off, lrot = local_offset(root, e.go)
+                parts[#parts + 1] = { go = go, holder = e.holder, mholder = e.mholder, path = e.path, state = "new",
+                    mask = e.mask, mask_n = e.mask_n, src = e.src, off = off, lrot = lrot,
+                    is_root = e.is_root, same_joints = e.same_joints, parent_joint = e.parent_joint }
+                log(string.format("  offset from root: %.3f %.3f %.3f  root=%s SameJointsConstraint=%s ParentJoint=%s",
+                    off.x, off.y, off.z, tostring(e.is_root), tostring(e.same_joints), tostring(e.parent_joint)))
+                local bits = {}
+                for i = 0, math.min(e.mask_n, 64) - 1 do bits[#bits + 1] = e.mask[i] and "1" or "0" end
+                log("  part: " .. e.path .. " (from " .. e.owner .. ") source parts[" .. e.mask_n .. "]=" .. table.concat(bits))
+            else
+                log("  FAIL instantiate for " .. e.path)
+            end
+        end
+    end
+    parts_frames = 0
+    -- The main dummy still wears Ethan's first-person shirt; hide it and keep it
+    -- only as the invisible anchor the parts follow.
+    safe(dummy.call, dummy, "set_DrawSelf", false)
+end
+
+-- The live character's look (e.g. Mia's infection) is driven by material
+-- variables the game sets at runtime; a fresh material gets defaults. Copy every
+-- float/float4 variable from the scene mesh. Variable types are logged once so
+-- the type ids can be confirmed.
+local INTEREST = { "infect", "mold", "black", "dirt", "blood", "damage", "wet", "blend", "rate", "mask" }
+local types_logged = false
+
+function copy_material_vars(src, dst, label)
+    if src == nil or dst == nil then return 0 end
+    local copied, notable = 0, {}
+    local types_seen = {}
+    local nm = tonumber(safe(src.call, src, "get_MaterialNum") or 0) or 0
+    for mi = 0, nm - 1 do
+        local mname = tostring(safe(src.call, src, "getMaterialName", mi))
+        local nv = tonumber(safe(src.call, src, "getMaterialVariableNum", mi) or 0) or 0
+        for vi = 0, nv - 1 do
+            local vname = tostring(safe(src.call, src, "getMaterialVariableName", mi, vi))
+            local vtype = safe(src.call, src, "getMaterialVariableType", mi, vi)
+            types_seen[tostring(vtype)] = vname
+            local value, ok = nil, false
+            if vtype == 0 or vtype == 1 then
+                value = safe(src.call, src, "getMaterialFloat", mi, vi)
+                if value ~= nil then ok = safe(dst.call, dst, "setMaterialFloat", mi, vi, value) ~= false end
+            elseif vtype == 4 or vtype == 2 then
+                value = safe(src.call, src, "getMaterialFloat4", mi, vi)
+                if value ~= nil then ok = safe(dst.call, dst, "setMaterialFloat4", mi, vi, value) ~= false end
+            end
+            if ok then copied = copied + 1 end
+            local lv = vname:lower()
+            for _, k in ipairs(INTEREST) do
+                if lv:find(k) then
+                    local dv = (vtype == 0 or vtype == 1) and safe(dst.call, dst, "getMaterialFloat", mi, vi) or nil
+                    notable[#notable + 1] = string.format("%s.%s(t%s)=%s dst=%s", mname, vname, tostring(vtype),
+                        type(value) == "number" and string.format("%.3f", value) or tostring(value),
+                        type(dv) == "number" and string.format("%.3f", dv) or tostring(dv))
+                    break
+                end
+            end
+        end
+    end
+    if not types_logged then
+        types_logged = true
+        local t = {}
+        for k, v in pairs(types_seen) do t[#t + 1] = k .. ":" .. v end
+        log("material var types (type:example): " .. table.concat(t, ", "))
+    end
+    log(string.format("  %s: copied %d material vars from scene", label, copied))
+    for _, s in ipairs(notable) do log("    " .. s) end
+    return copied
+end
+
+local parts_mode = "source"  -- "source" = copy scene character's parts mask, "all" = everything on
+
+function apply_mask(part)
+    local mesh = part.mesh
+    if mesh == nil then return end
+    local n = tonumber(safe(mesh.call, mesh, "getPartsEnableCount") or 0) or 0
+    for i = 0, n - 1 do
+        local on = true
+        if parts_mode == "source" and part.mask_n > 0 then on = part.mask[i] == true end
+        safe(mesh.call, mesh, "setPartsEnable", i, on)
+    end
+end
+
+-- Finish parts a few frames after spawning (components aren't ready at once),
+-- then keep them glued to the main dummy's position.
+re.on_frame(function()
+    record_player()
+    local nok, nerr = pcall(net_io)
+    if not nok and not net.io_err then net.io_err = true log("net ERR " .. tostring(nerr)) end
+    if #parts == 0 or dummy == nil then return end
+    parts_frames = parts_frames + 1
+
+    local dtr = dummy:call("get_Transform")
+    local anchor_rot = nil
+    if follow then
+        local s
+        local list = net.enabled and net.history or history
+        local tr = os.clock() - (net.enabled and net.delay or DELAY)
+        s = sample_interp(list, tr)
+        -- The ghost renders in the past, so the next LOOKAHEAD s are already
+        -- buffered: take velocity from there so the walk starts as he moves.
+        local a = sample_interp(list, tr + LOOKAHEAD)
+        local b = sample_interp(list, tr + LOOKAHEAD - 0.12)
+        if a and b then
+            anim.vel = { x = (a.pos.x - b.pos.x) / 0.12, z = (a.pos.z - b.pos.z) / 0.12 }
+        end
+        if s and s.look_yaw then look.yaw, look.pitch = s.look_yaw, s.look_pitch end
+        anim.flags = s and s.flags or nil
+        if s then
+            pcall(dtr.call, dtr, "set_Position", s.pos)
+            -- Ease the body toward the incoming facing (time constant TURN_TAU) so
+            -- turns read as turns instead of snapping.
+            local now_t = os.clock()
+            local dt = math.min(0.1, now_t - (anim.turn_t or now_t))
+            anim.turn_t = now_t
+            local tq = { x = s.rot.x, y = s.rot.y, z = s.rot.z, w = s.rot.w }
+            local cq = anim.body_q or tq
+            local dot = cq.x * tq.x + cq.y * tq.y + cq.z * tq.z + cq.w * tq.w
+            if dot < 0 then tq = { x = -tq.x, y = -tq.y, z = -tq.z, w = -tq.w } end
+            local a = 1 - math.exp(-dt / TURN_TAU)
+            local q = { x = cq.x + (tq.x - cq.x) * a, y = cq.y + (tq.y - cq.y) * a,
+                z = cq.z + (tq.z - cq.z) * a, w = cq.w + (tq.w - cq.w) * a }
+            local len = math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
+            if len < 1e-6 then q, len = tq, 1 end
+            q = { x = q.x / len, y = q.y / len, z = q.z / len, w = q.w / len }
+            anim.body_q = q
+            local rq = Quaternion.new(q.w, q.x, q.y, q.z)
+            pcall(dtr.call, dtr, "set_Rotation", rq)
+            anchor_rot = rq
+        end
+    end
+    local anchor = safe(dtr.call, dtr, "get_Position")
+    anchor_rot = anchor_rot or safe(dtr.call, dtr, "get_Rotation")
+    pcall(poll_clips)
+    pcall(verify_playback)
+    local aok, aerr = pcall(auto_animate, anchor, anchor_rot)
+    if not aok and not anim.auto_err then anim.auto_err = true log("auto ERR " .. tostring(aerr)) end
+
+    if parts_frames % 120 == 0 and anchor then
+        local pp = get_player():call("get_Transform"):call("get_Position")
+        local dx, dz = anchor.x - pp.x, anchor.z - pp.z
+        local plines = {}
+        for _, part in ipairs(parts) do
+            local p = safe(function() return part.go:call("get_Transform"):call("get_Position") end)
+            plines[#plines + 1] = string.format("  %s: %s", part.path:match("([^/]+)%.mesh$") or "?",
+                p and string.format("%.3f %.3f %.3f", p.x, p.y, p.z) or "?")
+        end
+        fs.write("coop_follow_state.txt", string.format(
+            "follow=%s\nanchor: %.3f %.3f %.3f\nplayer: %.3f %.3f %.3f\ngap: %.2f m\nhistory: %d samples\nparts:\n%s",
+            tostring(follow), anchor.x, anchor.y, anchor.z, pp.x, pp.y, pp.z,
+            math.sqrt(dx * dx + dz * dz), #history, table.concat(plines, "\n")))
+    end
+    for _, part in ipairs(parts) do
+        if part.state == "new" and parts_frames > 90 then
+            local ok, err = pcall(function()
+                part.go:call("set_DrawSelf", true)
+                part.go:call("set_UpdateSelf", true)
+                local mesh = part.go:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
+                mesh:call("setMesh", part.holder)
+                mesh:call("set_Material", part.mholder)
+                mesh:call("set_Enabled", false)
+                mesh:call("set_Enabled", true)
+                -- Ethan's Shadow* meshes are shadow-only in the source; RE Engine skips
+                -- animating skeletons it thinks are invisible, which froze the ghost.
+                -- Force normal drawing on every piece.
+                local src_dd = part.src and safe(part.src.call, part.src, "get_DrawDefault")
+                local src_sc = part.src and safe(part.src.call, part.src, "get_DrawShadowCast")
+                mesh:call("set_DrawDefault", true)
+                mesh:call("set_DrawShadowCast", true)
+                log(string.format("  %s: source DrawDefault=%s DrawShadowCast=%s -> forced DrawDefault=true",
+                    part.path:match("([^/]+)%.mesh$") or "?", tostring(src_dd), tostring(src_sc)))
+                part.mesh = mesh
+                apply_mask(part)
+                -- Mirror the source hierarchy: non-root pieces (heads) are children of
+                -- the body and borrow its joints, or they collapse to the origin.
+                if not part.is_root then
+                    local root_part = nil
+                    for _, q in ipairs(parts) do if q.is_root then root_part = q end end
+                    if root_part then
+                        local ptr = part.go:call("get_Transform")
+                        ptr:call("set_Parent", root_part.go:call("get_Transform"))
+                        -- set_Parent keeps the old world coords as local ones; reset them.
+                        ptr:call("set_LocalPosition", Vector3f.new(0, 0, 0))
+                        ptr:call("set_LocalRotation", Quaternion.new(1, 0, 0, 0))
+                        if part.same_joints ~= nil then ptr:call("set_SameJointsConstraint", part.same_joints) end
+                        if part.parent_joint and part.parent_joint ~= "" then ptr:call("set_ParentJoint", part.parent_joint) end
+                        part.parented = true
+                    end
+                end
+            end)
+            part.state = ok and "shown" or "failed"
+            log("  part " .. part.path .. ": " .. (ok and "shown" or ("ERR " .. tostring(err))))
+            part.vars_at = parts_frames + 30
+            if ok and part.is_root then
+                local aok, aerr = pcall(setup_animation, part)
+                if not aok then log("animation setup ERR " .. tostring(aerr)) end
+            end
+        end
+        -- Material instances exist only after the mesh is enabled; copy a bit later.
+        if part.state == "shown" and part.vars_at and parts_frames >= part.vars_at then
+            part.vars_at = nil
+            pcall(copy_material_vars, part.src, part.mesh, part.path:match("([^/]+)%.mesh$") or part.path)
+        end
+        if anchor and not part.parented then
+            local okp, perr = pcall(function()
+                local ptr = part.go:call("get_Transform")
+                local aq = anchor_rot and { x = anchor_rot.x, y = anchor_rot.y, z = anchor_rot.z, w = anchor_rot.w }
+                    or { x = 0, y = 0, z = 0, w = 1 }
+                local o = part.off and qrot(aq, part.off) or { x = 0, y = 0, z = 0 }
+                ptr:call("set_Position", Vector3f.new(anchor.x + o.x, anchor.y + o.y, anchor.z + o.z))
+                local r = part.lrot and qmul(aq, part.lrot) or aq
+                ptr:call("set_Rotation", Quaternion.new(r.w, r.x, r.y, r.z))
+                if not part.rot_checked then
+                    part.rot_checked = true
+                    local b = ptr:call("get_Rotation")
+                    log(string.format("  rot check %s: wanted xyzw %.3f %.3f %.3f %.3f, got %.3f %.3f %.3f %.3f",
+                        part.path:match("([^/]+)%.mesh$") or "?", r.x, r.y, r.z, r.w, b.x, b.y, b.z, b.w))
+                end
+            end)
+            if not okp and not part.follow_err then
+                part.follow_err = true
+                log("  follow update ERR " .. (part.path:match("([^/]+)%.mesh$") or "?") .. ": " .. tostring(perr))
+            end
+        end
+    end
+end)
+local current = "pl0001 (Ethan first-person, original)"
+
+local function set_motion_enabled(on)
+    local m = dummy and safe(dummy.call, dummy, "getComponent(System.Type)", sdk.typeof("via.motion.Motion"))
+    if m then safe(m.call, m, "set_Enabled", on) end
+end
+
+re.on_draw_ui(function()
+    if not imgui.tree_node("coop_dummy (ghost body test)") then return end
+    imgui.text("Showing: " .. current)
+    if dummy_mesh == nil then
+        imgui.text("waiting for the dummy to spawn...")
+    else
+        local fchanged, fv = imgui.checkbox("Move the ghost (source: " ..
+            (net.enabled and "network" or ("my own path, " .. DELAY .. " s behind")) .. ")", follow)
+        if fchanged then follow = fv log("follow = " .. tostring(fv)) end
+        local nchanged, nv = imgui.checkbox("Drive ghost from NETWORK (CoopNet plugin)", net.enabled)
+        if nchanged then
+            net.enabled = nv
+            net.history, net.last_in_seq, net.offset = {}, -1, nil
+            log("net.enabled = " .. tostring(nv))
+        end
+        if net.enabled then
+            if imgui.button("Delay 3 s (echo test)") then net.delay = 3.0 log("net.delay = 3.0") end
+            imgui.same_line()
+            if imgui.button("Delay 0.15 s (live)") then net.delay = 0.15 log("net.delay = 0.15") end
+            imgui.text(string.format("net: delay %.2f s, %d samples, last seq %d, offset %s",
+                net.delay, #net.history, net.last_in_seq, net.offset and string.format("%.3f", net.offset) or "-"))
+            imgui.text("CoopNet: " .. net.stats)
+            local lchanged, lv = imgui.checkbox("Head look v3 (turns off by itself if the walk freezes)", look.enabled)
+            if lchanged then look.enabled = lv log("look.enabled = " .. tostring(lv)) end
+        end
+        if #parts > 0 then
+            local all = parts_mode == "all"
+            local pchanged, pv = imgui.checkbox("Show ALL mesh parts (variants overlap)", all)
+            if pchanged then
+                parts_mode = pv and "all" or "source"
+                for _, part in ipairs(parts) do apply_mask(part) end
+                log("parts_mode = " .. parts_mode)
+            end
+        end
+        if anim.ready then
+            imgui.text(string.format("Animation: %d clips. Playing: %s | WALK=%s IDLE=%s", #anim.clips,
+                anim.playing and anim.playing.name or "-", anim.walk and anim.walk.name or "unset",
+                anim.idle and anim.idle.name or "unset"))
+            local achanged, av = imgui.checkbox("Auto: walk when moving, idle when still", anim.auto)
+            if achanged then anim.auto = av log("anim auto = " .. tostring(av)) end
+            imgui.text(string.format("ghost speed %.2f m/s, stance %s, direction %s, clip %s, playback x%.2f", anim.speed or 0,
+                anim.stance or "-", anim.dir or "-", anim.playing and anim.playing.name or "-", anim.rate or 1))
+            local rchanged, rv = imgui.slider_float("Walk clip natural speed (m/s)", anim.walk_ref, 0.5, 3.0)
+            if rchanged then anim.walk_ref = rv end
+            if imgui.tree_node("Clips (walk/idle/wait/run/move/stand)") then
+                local shown = 0
+                for i, c in ipairs(anim.clips) do
+                    local ln = c.name:lower()
+                    if shown < 60 and (ln:find("walk") or ln:find("idle") or ln:find("wait") or ln:find("run")
+                        or ln:find("move") or ln:find("stand") or ln:find("loop")) then
+                        shown = shown + 1
+                        if imgui.button(c.name .. "##play" .. i) then
+                            anim.auto = false  -- a manual pick sticks; Auto would override it
+                            log("anim auto = false (manual clip)")
+                            play_clip(c)
+                        end
+                        imgui.same_line()
+                        if imgui.button("WALK##w" .. i) then anim.walk = c log("walk = " .. c.name) play_clip(c) end
+                        imgui.same_line()
+                        if imgui.button("IDLE##i" .. i) then anim.idle = c log("idle = " .. c.name) play_clip(c) end
+                    end
+                end
+                if shown == 0 then imgui.text("(no matching names; see coop_motions.txt)") end
+                imgui.tree_pop()
+            end
+        end
+        local changed, v = imgui.checkbox("Copy my pose onto it", copy_pose)
+        if changed then copy_pose = v log("copy_pose = " .. tostring(v)) end
+        if imgui.button("Dummy animation OFF") then set_motion_enabled(false) log("dummy Motion disabled") end
+        imgui.same_line()
+        if imgui.button("Dummy animation ON") then set_motion_enabled(true) log("dummy Motion enabled") end
+        if imgui.button("Move it next to me") then
+            local p = get_player():call("get_Transform"):call("get_Position")
+            dummy:call("get_Transform"):call("set_Position", Vector3f.new(p.x + 1.5, p.y, p.z))
+            log("moved dummy next to player")
+        end
+        local cchanged, cv = imgui.checkbox(string.format("Collide with the other player (%d pushes)", collide and collide.pushes or 0),
+            collide and collide.enabled)
+        if cchanged and collide then collide.enabled = cv log("collide.enabled = " .. tostring(cv)) end
+        -- The ghost builds itself as Ethan; this only redoes it (e.g. after a load).
+        if imgui.button("Rebuild Ethan") then
+            local ok, err = pcall(build_ethan)
+            if not ok then log("rebuild Ethan ERR " .. tostring(err)) end
+        end
+        if imgui.tree_node("Other characters (debug)") then
+            for i, c in ipairs(candidates) do
+                local short = c.mesh:match("([^/]+)%.mesh$") or c.mesh
+                if c.mesh:find("Enemy") and imgui.button("Assemble full character of " .. short .. "##asm" .. i) then
+                    parts_mode = "source"
+                    anim_from_player = false
+                    local ok, err = pcall(assemble_from, c)
+                    if not ok then log("assemble ERR " .. tostring(err)) end
+                end
+            end
+            imgui.text("Single models loaded in this area:")
+            for i, c in ipairs(candidates) do
+                local short = c.mesh:match("([^/]+)%.mesh$") or c.mesh
+                if imgui.button(string.format("%d. %s##one%d", i, short, i)) then
+                    local ok, err = pcall(apply_model, dummy_mesh, c)
+                    current = c.mesh
+                    log("picker: applied " .. c.mesh .. " -> " .. (ok and "ok" or ("ERR " .. tostring(err))))
+                end
+            end
+            imgui.tree_pop()
+        end
+    end
+    imgui.tree_pop()
+end)
+
+function apply_model(mesh, model)
+    local holder = model.holder
+    if holder == nil then
+        local r = sdk.create_resource("via.render.MeshResource", model.mesh)
+        r:add_ref()
+        holder = r:create_holder("via.render.MeshResourceHolder")
+        holder:add_ref()
+    end
+    mesh:call("setMesh", holder)
+    local mholder = model.mholder
+    if mholder == nil and model.mdf then
+        local r = sdk.create_resource("via.render.MeshMaterialResource", model.mdf)
+        r:add_ref()
+        mholder = r:create_holder("via.render.MeshMaterialResourceHolder")
+        mholder:add_ref()
+    end
+    if mholder then mesh:call("set_Material", mholder) end
+    -- rebuild the render instance and show every part of the new mesh
+    mesh:call("set_Enabled", false)
+    mesh:call("set_Enabled", true)
+    local n = tonumber(safe(mesh.call, mesh, "getPartsEnableCount") or 0) or 0
+    for i = 0, n - 1 do safe(mesh.call, mesh, "setPartsEnable", i, true) end
+end
+
+local model = nil
+local phase, frames, t0 = "wait", 0, 0
+
+re.on_frame(function()
+    frames = frames + 1
+    if phase == "wait" then
+        if get_player() and frames > 60 then
+            local vr = sdk.get_managed_singleton("app.vr.VrManager")
+            prefab = vr and vr:get_field("DummyPlayerPrefab")
+            if prefab == nil then log("FAIL: VrManager.DummyPlayerPrefab is nil") phase = "done" return end
+            log("prefab: " .. tostring(safe(prefab.call, prefab, "get_Path")))
+            local existing = vr:get_field("_DummyPlayer")
+            log("VrManager._DummyPlayer before spawn: " .. tostring(existing and existing:call("get_Name")))
+            safe(prefab.call, prefab, "set_Standby", true)
+            phase, t0 = "standby", os.clock()
+        end
+    elseif phase == "standby" then
+        local ready = safe(prefab.call, prefab, "get_Ready")
+        if ready or os.clock() - t0 > 10 then
+            local p = get_player():call("get_Transform"):call("get_Position")
+            local pos = Vector3f.new(p.x + 2.0, p.y, p.z)
+            local go, err = safe(prefab.call, prefab, "instantiate(via.vec3)", pos)
+            if go == nil then
+                log("FAIL instantiate(via.vec3): " .. tostring(err))
+                go, err = safe(prefab.call, prefab, "instantiate(via.vec3, via.Folder)", pos, get_player():call("get_Folder"))
+            end
+            if go == nil then log("FAIL instantiate: " .. tostring(err)) phase = "done" return end
+            dummy = go
+            log(string.format("instantiated at %.2f %.2f %.2f (ready=%s)", pos.x, pos.y, pos.z, tostring(ready)))
+            phase, t0 = "spawned", os.clock()
+        end
+    elseif phase == "spawned" and os.clock() - t0 > 3 then
+        -- give async resources a moment, then record what we got
+        dump_tree(dummy, 0, { n = 200 })
+        -- The prefab spawns hidden; VR mode shows it via updateDummyPlayer() only
+        -- during VR events. Turn it on ourselves.
+        safe(dummy.call, dummy, "set_DrawSelf", true)
+        safe(dummy.call, dummy, "set_UpdateSelf", true)
+        local mesh = safe(dummy.call, dummy, "getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
+        if mesh then
+            safe(mesh.call, mesh, "set_Enabled", true)
+            safe(mesh.call, mesh, "set_DrawDefault", true)
+            local n = tonumber(safe(mesh.call, mesh, "getPartsEnableCount") or 0) or 0
+            for i = 0, n - 1 do safe(mesh.call, mesh, "setPartsEnable", i, true) end
+            log("enabled DrawSelf, UpdateSelf, mesh and " .. n .. " parts")
+        end
+        phase, t0 = "shown", os.clock()
+    elseif phase == "shown" and os.clock() - t0 > 2 then
+        dump_tree(dummy, 0, { n = 200 })
+        -- Compare materials with the live player, then take the player's.
+        local mesh = dummy:call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
+        local pmesh = get_player():call("getComponent(System.Type)", sdk.typeof("via.render.Mesh"))
+        local function mats(m)
+            local n = tonumber(safe(m.call, m, "get_MaterialNum") or 0) or 0
+            local out = {}
+            for i = 0, n - 1 do out[#out + 1] = tostring(safe(m.call, m, "getMaterialName", i)) end
+            local h = safe(m.call, m, "get_Material")
+            return n, table.concat(out, ","), tostring(h and safe(h.call, h, "get_ResourcePath"))
+        end
+        log(string.format("dummy materials: %d [%s] mdf=%s", mats(mesh)))
+        log(string.format("player materials: %d [%s] mdf=%s", mats(pmesh)))
+        local _, err = safe(mesh.call, mesh, "set_Material", pmesh:call("get_Material"))
+        log("copied player material: " .. (err and ("ERR " .. tostring(err)) or "ok"))
+        dummy_mesh = mesh
+        phase, t0 = "material", os.clock()
+    elseif phase == "material" and os.clock() - t0 > 2 then
+        log(string.format("after copy: MaterialReady=%s ReadyToDraw=%s",
+            tostring(safe(dummy_mesh.call, dummy_mesh, "get_MaterialReady")),
+            tostring(safe(dummy_mesh.call, dummy_mesh, "get_ReadyToDraw"))))
+        -- Don't auto-swap: list loaded models in the REFramework menu and let the
+        -- owner try them one by one (see re.on_draw_ui below).
+        candidates = find_full_model()
+        log("picker ready with " .. #candidates .. " models (REFramework menu > coop_dummy)")
+        phase = "done"
+        -- The co-op ghost is always Ethan: build him from the player's Shadow set
+        -- as soon as the stand-in body is ready, no button needed.
+        local ok, err = pcall(build_ethan)
+        if not ok then log("auto Ethan ERR " .. tostring(err)) end
+    elseif phase == "swapped" and os.clock() - t0 > 3 then
+        log(string.format("after swap: MaterialReady=%s ReadyToDraw=%s parts=%s",
+            tostring(safe(dummy_mesh.call, dummy_mesh, "get_MaterialReady")),
+            tostring(safe(dummy_mesh.call, dummy_mesh, "get_ReadyToDraw")),
+            tostring(safe(dummy_mesh.call, dummy_mesh, "getPartsEnableCount"))))
+        phase = "done"
+    end
+
+    -- Pose the dummy's skeleton from the player's every frame.
+    if dummy and copy_pose and (phase == "material" or phase == "done") then
+        local ptr = get_player() and get_player():call("get_Transform")
+        local dtr = safe(dummy.call, dummy, "get_Transform")
+        if ptr and dtr then
+            local _, err = safe(dtr.call, dtr, "copyJointsLocalMatrix", ptr)
+            if err and not pose_err_logged then pose_err_logged = true log("pose copy error: " .. tostring(err)) end
+        end
+    end
+
+    if dummy then
+        local p = safe(function() return dummy:call("get_Transform"):call("get_Position") end)
+        if p then
+            pcall(draw.world_text, "coop_dummy", p, 0xFF00FFFF)   -- ABGR: yellow
+            if frames % 120 == 0 then
+                fs.write("coop_dummy_state.txt", string.format("dummy: %.3f %.3f %.3f", p.x, p.y, p.z))
+            end
+        end
+    end
+end)
+
+-- Head look v2: through the Motion component, not behind its back. v1 wrote
+-- via.Joint world rotations before rendering, which made RE7 stop animating the
+-- skeleton and let the turns accumulate. Here, right after the engine's motion
+-- update, each joint starts from this frame's animated local pose
+-- (getCalculatedLocalRotation), gets the look turn conjugated into its parent's
+-- space, and is written with Motion.setLocalRotation. No accumulation possible.
+local look2 = { list = nil, fired = 0, reported = false, t0 = os.clock() }
+
+local function look2_joints(m)
+    local go = m:call("get_GameObject")
+    local tr = go:call("get_Transform")
+    local arr = tr:call("get_Joints")
+    local neck, head
+    for _, j in ipairs((arr and arr:get_elements()) or {}) do
+        local n = tostring(safe(j.call, j, "get_Name")):lower()
+        if neck == nil and n:find("neck") then neck = j end
+        if head == nil and n:find("head") and not n:find("end") then head = j end
+    end
+    local list = {}
+    for _, e in ipairs({ { neck, 0.4 }, { head, 0.6 } }) do
+        if e[1] then
+            local idx = m:call("getJointIndexByNameHash", e[1]:call("get_NameHash"))
+            list[#list + 1] = { idx = idx, share = e[2], name = tostring(e[1]:call("get_Name")) }
+        end
+    end
+    log("look v2: " .. #list .. " joints: " .. table.concat((function()
+        local t = {} for _, e in ipairs(list) do t[#t + 1] = e.name .. "#" .. tostring(e.idx) end return t end)(), ", "))
+    return list
+end
+
+local function apply_look_motion()
+    local m = anim.motion
+    if m == nil then return end
+    if look2.list == nil then look2.list = look2_joints(m) end
+    local root_q = m:call("get_GameObject"):call("get_Transform"):call("get_Rotation")
+    local bq = { x = root_q.x, y = root_q.y, z = root_q.z, w = root_q.w }
+    local yaw = math.max(-1.2, math.min(1.2, look.yaw))
+    local pitch = math.max(-0.7, math.min(0.7, look.pitch))
+    local rx, ry, rz = qrot_v(bq, 1, 0, 0)
+    for _, e in ipairs(look2.list) do
+        if e.idx and e.idx >= 0 then
+            local pidx = m:call("getParentJointIndex", e.idx)
+            local pw = m:call("getWorldRotation", pidx)
+            local al = m:call("getCalculatedLocalRotation", e.idx)
+            local P = { x = pw.x, y = pw.y, z = pw.z, w = pw.w }
+            local A = { x = al.x, y = al.y, z = al.z, w = al.w }
+            local D = qmul_l(axis_q(0, 1, 0, yaw * e.share), axis_q(rx, ry, rz, -pitch * e.share))
+            -- new_local = conj(P) * D * P * A  (world-space turn D, expressed in parent space)
+            local n = qmul_l(qmul_l(qmul_l({ x = -P.x, y = -P.y, z = -P.z, w = P.w }, D), P), A)
+            m:call("setLocalRotation", e.idx, Quaternion.new(n.w, n.x, n.y, n.z))
+            if e.name:lower():find("head") then
+                local rb = m:call("getLocalRotation", e.idx)
+                look2.last = string.format("yaw %.2f pitch %.2f | anim %.3f %.3f %.3f %.3f | set %.3f %.3f %.3f %.3f | readback %.3f %.3f %.3f %.3f",
+                    look.yaw, look.pitch, A.x, A.y, A.z, A.w, n.x, n.y, n.z, n.w, rb.x, rb.y, rb.z, rb.w)
+            end
+        end
+    end
+end
+
+-- What the Head joint holds once drawing starts (after our v3 write).
+re.on_application_entry("PrepareRendering", function()
+    if not (look.enabled and look2.list and anim.motion) then return end
+    local now = os.clock()
+    if now - (look2.diag_t or 0) < 2 then return end
+    look2.diag_t = now
+    pcall(function()
+        local tr = anim.motion:call("get_GameObject"):call("get_Transform")
+        local hj = tr:call("getJointByName", "Head")
+        local lr = hj and hj:call("get_LocalRotation")
+        log("look v2 diag: " .. tostring(look2.last) ..
+            (lr and string.format(" | at render %.3f %.3f %.3f %.3f", lr.x, lr.y, lr.z, lr.w) or " | at render: no Head joint"))
+    end)
+end)
+
+-- v2 diagnostics (19:00): setLocalRotation in the UpdateMotion hook is accepted
+-- (readback matches) but by render time the Head joint is back to the plain
+-- animated pose: Motion writes its own result into the skeleton afterwards.
+-- So the hook only counts; the write happens at PrepareRendering (below).
+re.on_application_entry("UpdateMotion", function()
+    look2.fired = look2.fired + 1
+end)
+
+-- v3: write the joints last, just before drawing. The base is Motion's freshly
+-- calculated pose for this frame (not what the joint holds now), so even if the
+-- engine skips a frame the turn can't accumulate the way v1 did.
+local function apply_look_render()
+    local m = anim.motion
+    if m == nil then return end
+    if look2.list == nil then look2.list = look2_joints(m) end
+    local tr = m:call("get_GameObject"):call("get_Transform")
+    if look2.jobj == nil then
+        look2.jobj = {}
+        for _, e in ipairs(look2.list) do look2.jobj[e.idx] = tr:call("getJointByName", e.name) end
+    end
+    local rq = tr:call("get_Rotation")
+    local bq = { x = rq.x, y = rq.y, z = rq.z, w = rq.w }
+    local yaw = math.max(-1.2, math.min(1.2, look.yaw))
+    local pitch = math.max(-0.7, math.min(0.7, look.pitch))
+    local rx, ry, rz = qrot_v(bq, 1, 0, 0)
+    for _, e in ipairs(look2.list) do
+        local j = look2.jobj[e.idx]
+        if j and e.idx >= 0 then
+            local pidx = m:call("getParentJointIndex", e.idx)
+            local pw = m:call("getWorldRotation", pidx)
+            local al = m:call("getCalculatedLocalRotation", e.idx)
+            local P = { x = pw.x, y = pw.y, z = pw.z, w = pw.w }
+            local A = { x = al.x, y = al.y, z = al.z, w = al.w }
+            local D = qmul_l(axis_q(0, 1, 0, yaw * e.share), axis_q(rx, ry, rz, -pitch * e.share))
+            local n = qmul_l(qmul_l(qmul_l({ x = -P.x, y = -P.y, z = -P.z, w = P.w }, D), P), A)
+            j:call("set_LocalRotation", Quaternion.new(n.w, n.x, n.y, n.z))
+            if e.name:lower():find("head") then
+                look2.last = string.format("yaw %.2f pitch %.2f | anim %.3f %.3f %.3f %.3f | set %.3f %.3f %.3f %.3f",
+                    look.yaw, look.pitch, A.x, A.y, A.z, A.w, n.x, n.y, n.z, n.w)
+            end
+        end
+    end
+end
+
+re.on_pre_application_entry("PrepareRendering", function()
+    if not (look.enabled and net.enabled and follow and anim.ready) then return end
+    local ok, err = pcall(apply_look_render)
+    if not ok and not look.err then look.err = true log("look v3 ERR " .. tostring(err)) end
+end)
+
+re.on_frame(function()
+    if not look2.reported and os.clock() - look2.t0 > 3 then
+        look2.reported = true
+        log("look v2: UpdateMotion hook fired " .. look2.fired .. " times in 3 s" ..
+            (look2.fired == 0 and " (hook name not valid in RE7?)" or ""))
+    end
+end)
+
+-- Player-vs-ghost collision ------------------------------------------------------
+-- The other player's own game keeps them out of walls; here we only stop the
+-- local player walking through the ghost. If we overlap a capsule around him,
+-- push the local player out along the line between us, via
+-- app.MovementController.warp(pos, rot) so RE7's character controller stays in
+-- sync (setting the transform directly gets undone).
+COLLIDE_RADIUS = 0.6     -- m, both bodies combined
+COLLIDE_HEIGHT = 1.7     -- m, vertical overlap that counts as touching
+collide = { enabled = true, pushes = 0, err = false }   -- global: the menu (defined earlier) reads it
+
+re.on_frame(function()
+    if not (collide.enabled and follow and dummy) or #parts == 0 then return end
+    local ok, err = pcall(function()
+        local player = get_player()
+        if player == nil then return end
+        local ptr = player:call("get_Transform")
+        local p = ptr:call("get_Position")
+        local g = dummy:call("get_Transform"):call("get_Position")
+        if math.abs(p.y - g.y) > COLLIDE_HEIGHT then return end
+        local dx, dz = p.x - g.x, p.z - g.z
+        local d = math.sqrt(dx * dx + dz * dz)
+        if d >= COLLIDE_RADIUS then return end
+        if d < 1e-3 then dx, dz, d = 1, 0, 1 end   -- exactly inside: pick a side
+        local push = COLLIDE_RADIUS - d
+        local np = Vector3f.new(p.x + dx / d * push, p.y, p.z + dz / d * push)
+        local mc = player:call("getComponent(System.Type)", sdk.typeof("app.MovementController"))
+        if mc == nil then return end
+        mc:call("warp(via.vec3, via.Quaternion)", np, ptr:call("get_Rotation"))
+        collide.pushes = collide.pushes + 1
+        if collide.pushes == 1 then log(string.format("collide: first push %.2f m (warp ok)", push)) end
+    end)
+    if not ok and not collide.err then collide.err = true log("collide ERR " .. tostring(err)) end
+end)
+
+re.on_script_reset(function()
+    local destroy = sdk.find_type_definition("via.GameObject"):get_method("destroy(via.GameObject)")
+    if dummy and destroy then pcall(destroy.call, destroy, nil, dummy) end
+    for _, part in ipairs(parts) do if destroy then pcall(destroy.call, destroy, nil, part.go) end end
+end)
+
+log("coop_dummy loaded")
