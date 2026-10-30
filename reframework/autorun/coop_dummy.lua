@@ -198,7 +198,26 @@ end
 -- Stance -----------------------------------------------------------------------
 -- Packed into the packet's animBank field: bit0 crouch, bit1 walking (vs jog),
 -- bit2 "flags present" (old senders and replay samples have none).
-STANCE_CROUCH, STANCE_WALK, STANCE_VALID = 1, 2, 4
+STANCE_CROUCH, STANCE_WALK, STANCE_VALID, STANCE_CUTSCENE = 1, 2, 4, 8
+
+-- In a cutscene? RE7 runs them as game events (app.GameEventManager, held in
+-- GameManager's static _GameEventMan: RunningEventControllers) or as movies
+-- (GameManager.PlayingMovie).
+local gem_field = nil
+function local_cutscene()
+    local gm = sdk.get_managed_singleton("app.GameManager")
+    if gm == nil then return false end
+    if safe(gm.get_field, gm, "PlayingMovie") ~= nil then return true end
+    if gem_field == nil then
+        local t = sdk.find_type_definition("app.GameManager")
+        gem_field = t and t:get_field("_GameEventMan") or false
+    end
+    local gem = gem_field and safe(gem_field.get_data, gem_field, nil)
+    local list = gem and safe(gem.get_field, gem, "RunningEventControllers")
+    local n = list and tonumber(safe(list.call, list, "get_Count") or 0) or 0
+    cutscene_events = n
+    return n > 0
+end
 
 local function player_movement(player)
     return player and safe(player.call, player, "getComponent(System.Type)", sdk.typeof("app.PlayerMovement"))
@@ -210,7 +229,15 @@ function local_stance_flags(player)
     local f = STANCE_VALID
     if safe(pm.call, pm, "get_isCrouch") then f = f + STANCE_CROUCH end
     if safe(pm.call, pm, "get_isWalk") then f = f + STANCE_WALK end
+    if cutscene_now then f = f + STANCE_CUTSCENE end   -- lets the other side hide us
     return f
+end
+
+-- Which chapter we're in (app.GameManager._CurrentChapter), shared so each side can
+-- tell when the other is somewhere else.
+function local_chapter()
+    local gm = sdk.get_managed_singleton("app.GameManager")
+    return tonumber(gm and safe(gm.get_field, gm, "_CurrentChapter") or 0) or 0
 end
 
 -- Ethan's real move speeds (same game on both PCs), as playback references.
@@ -332,8 +359,11 @@ local function net_io()
         local p, q = tr:call("get_Position"), tr:call("get_Rotation")
         local ly, lp = local_look(q)
         net.seq = net.seq + 1
-        fs.write("coopnet_out.txt", string.format("%d %.4f %.5f %.5f %.5f %.6f %.6f %.6f %.6f %d 0 0 %.4f %.4f\n",
-            net.seq, now, p.x, p.y, p.z, q.x, q.y, q.z, q.w, local_stance_flags(player), ly, lp))
+        -- animId carries our chapter; animFrame echoes the newest sender time we've
+        -- received from the peer (mod 1000 s), so they can measure the round trip.
+        fs.write("coopnet_out.txt", string.format("%d %.4f %.5f %.5f %.5f %.6f %.6f %.6f %.6f %d %d %.4f %.4f %.4f\n",
+            net.seq, now, p.x, p.y, p.z, q.x, q.y, q.z, q.w, local_stance_flags(player), local_chapter(),
+            (net.peer_t or 0) % 1000, ly, lp))
     end
 
     if fs.read == nil then
@@ -355,6 +385,14 @@ local function net_io()
                     net.history[#net.history + 1] = { t = t + net.offset,
                         pos = Vector3f.new(v[3], v[4], v[5]), rot = Quaternion.new(v[9], v[6], v[7], v[8]),
                         flags = math.floor(v[10]), look_yaw = v[13], look_pitch = v[14] }
+                    net.peer_t = t                         -- echoed back to the peer
+                    net.peer_chapter = math.floor(v[11])
+                    -- Round trip: the peer echoes our own send time (mod 1000 s).
+                    if v[12] and v[12] > 0 then
+                        local rtt = (now % 1000) - v[12]
+                        if rtt < 0 then rtt = rtt + 1000 end
+                        if rtt < 5 then net.ping = net.ping and (net.ping * 0.8 + rtt * 0.2) or rtt end
+                    end
                 end
             end
         end
@@ -589,22 +627,34 @@ local function poll_clips()
         -- frozen while its transform moves. Pick walk/idle by name and start now.
         -- Ethan's bank has a full locomotion set; pick it by exact name. Otherwise
         -- (Mia) fall back to the first walk/idle-looking names.
+        -- Player banks name clips "<plXXXX>_<suffix>" (Ethan pl0000_Hands_Walk_Loop);
+        -- other playable characters (the videotapes) use their own prefix, so look the
+        -- locomotion set up by suffix.
         local by_name = {}
-        for _, c in ipairs(anim.clips) do if by_name[c.name] == nil then by_name[c.name] = c end end
+        for _, c in ipairs(anim.clips) do
+            local suffix = c.name:gsub("^pl%d+_", "")
+            if by_name[suffix] == nil then by_name[suffix] = c end
+        end
         local set = {
-            fwd = by_name["pl0000_Hands_Walk_Loop"], back = by_name["pl0000_Hands_WalkB_Loop"],
-            left = by_name["pl0000_Hands_WalkL_Loop"], right = by_name["pl0000_Hands_WalkR_Loop"],
-            jfwd = by_name["pl0000_Hands_Jog_Loop"], jback = by_name["pl0000_Hands_JogB_Loop"],
-            jleft = by_name["pl0000_Hands_JogL_Loop"], jright = by_name["pl0000_Hands_JogR_Loop"],
-            cfwd = by_name["pl0000_Hands_WalkCrouch_Loop"], cback = by_name["pl0000_Hands_WalkCrouchB_Loop"],
-            cleft = by_name["pl0000_Hands_WalkCrouchL_Loop"], cright = by_name["pl0000_Hands_WalkCrouchR_Loop"],
-            cidle = by_name["pl0000_Hands_Crouch_Loop"],
+            fwd = by_name["Hands_Walk_Loop"], back = by_name["Hands_WalkB_Loop"],
+            left = by_name["Hands_WalkL_Loop"], right = by_name["Hands_WalkR_Loop"],
+            jfwd = by_name["Hands_Jog_Loop"], jback = by_name["Hands_JogB_Loop"],
+            jleft = by_name["Hands_JogL_Loop"], jright = by_name["Hands_JogR_Loop"],
+            cfwd = by_name["Hands_WalkCrouch_Loop"], cback = by_name["Hands_WalkCrouchB_Loop"],
+            cleft = by_name["Hands_WalkCrouchL_Loop"], cright = by_name["Hands_WalkCrouchR_Loop"],
             -- Not Stand_Loop: it never binds and jams the layer (18:50, 19:09), and
             -- as the first clip of a fresh ghost it leaves him T-posed for good.
-            idle = by_name["pl0000_Hands_StandDamage_Loop"] or by_name["pl0000_Hands_Stand_Loop"],
+            idle = by_name["Hands_StandDamage_Loop"] or by_name["Hands_Stand_Loop"],
         }
+        -- Stand_Loop and Crouch_Loop (20:49) jam the layer; crouching still is the
+        -- crouch-walk clip held on one frame instead. Retire them under any prefix.
         anim.bad = anim.bad or {}
-        anim.bad["pl0000_Hands_Stand_Loop"] = true
+        for _, c in ipairs(anim.clips) do
+            local suffix = c.name:gsub("^pl%d+_", "")
+            if suffix == "Hands_Stand_Loop" or suffix == "Hands_Crouch_Loop" then anim.bad[c.name] = true end
+        end
+        set.cidle = nil
+        if set.idle and anim.bad[set.idle.name] then set.idle = nil end
         if set.fwd and set.idle then
             anim.set, anim.walk, anim.idle = set, set.fwd, set.idle
             anim.walk_ref, anim.jog_ref, anim.crouch_ref = 1.3, 3.2, 0.9
@@ -646,12 +696,14 @@ function rebuild_layer()
 end
 
 -- Fallback idles once a clip has been retired as bad.
-local IDLE_FALLBACKS = { "pl0000_Hands_Stand_Loop", "pl0000_Hands_StandDamage_Loop", "pl0000_E-Radar_Stand_Loop" }
+-- Matched by suffix so they work for any playable character's bank.
+local IDLE_FALLBACKS = { "Hands_StandDamage_Loop", "E-Radar_Stand_Loop" }
 function next_idle()
-    for _, name in ipairs(IDLE_FALLBACKS) do
-        if not (anim.bad and anim.bad[name]) then
-            for _, c in ipairs(anim.clips) do
-                if c.name == name then log("idle fallback -> " .. name) return c end
+    for _, suffix in ipairs(IDLE_FALLBACKS) do
+        for _, c in ipairs(anim.clips) do
+            if c.name:gsub("^pl%d+_", "") == suffix and not (anim.bad and anim.bad[c.name]) then
+                log("idle fallback -> " .. c.name)
+                return c
             end
         end
     end
@@ -722,7 +774,12 @@ local function verify_playback()
     -- jams the layer for good (2026-10-29 18:50). Detect a bad bind or a stuck
     -- frame, rebuild the layer, retire the clip, and move to a fallback idle.
     local want_end = anim.playing and tonumber(anim.playing.frames or 0) or 0
-    local wrong_end = want_end > 0 and endf > 0 and math.abs(endf - want_end) > 0.5
+    -- During a blend the layer can still report the previous clip's length (20:50:
+    -- JogB showed 48, JogL's), so a wrong length only counts on two checks in a row.
+    local wrong_now = want_end > 0 and endf > 0 and math.abs(endf - want_end) > 0.5
+    local wrong_end = wrong_now and anim.wrong_prev == (anim.playing and anim.playing.name)
+    anim.wrong_prev = wrong_now and (anim.playing and anim.playing.name) or nil
+    if wrong_now and not wrong_end then anim.verify_at = os.clock() + 0.5 end   -- re-check soon
     -- (Head look v3 is proven safe, so a freeze no longer switches it off.)
     if (frozen or wrong_end) and anim.playing then
         local bad = anim.playing
@@ -826,7 +883,9 @@ local function auto_animate(anchor, anchor_rot)
     local has = (f & STANCE_VALID) ~= 0
     local crouch = has and (f & STANCE_CROUCH) ~= 0
     local s = anim.set
-    local still_clip = (crouch and s and s.cidle and not (anim.bad and anim.bad[s.cidle.name])) and s.cidle or anim.idle
+    local still_clip = (crouch and s and s.cidle and not (anim.bad and anim.bad[s.cidle.name])) and s.cidle
+        or (crouch and s and s.cfwd) or anim.idle
+    local hold_still = crouch and s and still_clip == s.cfwd   -- crouch-walk frozen on one frame
     local want, ref = still_clip, anim.walk_ref
     if anim.moving then
         want = anim.walk
@@ -874,7 +933,7 @@ local function auto_animate(anchor, anchor_rot)
         end
     end
     -- Last-resort idle is the walk clip held still.
-    if want == anim.idle and anim.idle_hold then
+    if (want == anim.idle and anim.idle_hold) or (not anim.moving and hold_still) then
         local layer = safe(anim.motion.call, anim.motion, "getLayer", 0)
         if layer then safe(layer.call, layer, "set_Speed", 0.0) end
     end
@@ -889,14 +948,15 @@ local function auto_animate(anchor, anchor_rot)
     end
 end
 
--- Build the co-op ghost as Ethan. His extra meshes all hang off the player
--- object; assembling from any of them collects the player's Shadow set (the
--- full-body Ethan RE7 renders only for his shadow), animated with the
--- player's own motion bank. Ethan's first-person view hides parts like the
--- head on the source, so every part is shown on the ghost.
+-- Build the co-op ghost from the local player's character. Its meshes hang off the
+-- player object; assembling from any of them collects the player's Shadow set (the
+-- full body RE7 renders only for the shadow), animated with the player's own motion
+-- bank. Usually Ethan (pl0000); in the videotapes both players play the same other
+-- character, so that character works the same way. First person hides parts like
+-- the head on the source, so every part is shown on the ghost.
 function build_ethan()
     for _, c in ipairs(candidates) do
-        if c.mesh:find("Player/pl0000") then
+        if c.mesh:find("Character/Player/pl%d") then
             local owner = safe(c.comp.call, c.comp, "get_GameObject")
             local root = owner and root_of(owner)
             -- skip standalone event props (e.g. sm1649_EthanLHand_Event)
@@ -924,6 +984,13 @@ function assemble_from(c)
     for _, old in ipairs(parts) do pcall(destroy.call, destroy, nil, old.go) end
     parts = {}
     anim.clips, anim.playing, anim.walk, anim.idle, anim.set, anim.retries = {}, nil, nil, nil, nil, 0
+    -- Head look caches the old ghost's joints; drop them or it addresses destroyed
+    -- objects ("Invoke threw an exception" after Rebuild Ethan, 20:54).
+    if look2 then look2.list, look2.jobj = nil, nil end
+    look.err = false
+    -- ...and the old ghost's Motion: until setup_animation binds the new one, head look
+    -- and the watchdog must not touch it (that was the remaining Invoke error, 21:04).
+    anim.motion, anim.ready, anim.verify_at, anim.last_verify_frame = nil, false, nil, nil
 
     local list = meshes_under(root)
     log("assemble: " .. #list .. " meshes under root")
@@ -940,10 +1007,13 @@ function assemble_from(c)
                 shadow[#shadow + 1] = e
             end
         end
-        if #shadow > 0 then
-            list = shadow
-            log("assemble: Ethan uses " .. #shadow .. " Shadow* pieces")
+        if #shadow == 0 then
+            -- No full body to borrow (e.g. the temporary loading-scene player): no ghost.
+            log("assemble: player '" .. tostring(root:call("get_Name")) .. "' has no Shadow body; no ghost yet")
+            return
         end
+        list = shadow
+        log("assemble: " .. tostring(root:call("get_Name")) .. " uses " .. #shadow .. " Shadow* pieces")
     end
     local p = get_player():call("get_Transform"):call("get_Position")
     for _, e in ipairs(list) do
@@ -1184,6 +1254,17 @@ local function set_motion_enabled(on)
     if m then safe(m.call, m, "set_Enabled", on) end
 end
 
+-- Settings shared with coop_saveguard.lua (reframework/data/coop_settings.json).
+settings = { allow_saving = false, hud = true, nameplate = true }
+do
+    local ok, s = pcall(json.load_file, "coop_settings.json")
+    if ok and type(s) == "table" then for k, v in pairs(s) do settings[k] = v end end
+end
+function save_settings()
+    local ok, err = pcall(json.dump_file, "coop_settings.json", settings)
+    if not ok then log("settings save ERR " .. tostring(err)) end
+end
+
 -- Connect panel: no config editing. Writes a one-line command that CoopNet.cs
 -- applies live ("steam <SteamID64>" or "bot") and saves for next launch.
 connect_ui = { friend = "", opened = false }
@@ -1228,6 +1309,196 @@ local function draw_connect_body()
     if imgui.button("Test with bot") then send_command("bot") end
     if connect_ui.friend ~= "" and not valid then imgui.text("That doesn't look like a SteamID64 (17 digits starting 7656119).") end
     if kv.lastCommand and kv.lastCommand ~= "-" then imgui.text("Last change: " .. kv.lastCommand) end
+
+    if imgui.separator then imgui.separator() end
+    -- Saving: off by default. On: the game saves normally; CoopNet backs the save
+    -- folder up now and at every launch (Steam Cloud shares saves with the real install).
+    local schanged, sv = imgui.checkbox("Allow saving (your saves are backed up automatically)", settings.allow_saving)
+    if schanged then
+        settings.allow_saving = sv
+        save_settings()
+        if sv then send_command("backup allow") end
+        log("settings: allow_saving = " .. tostring(sv))
+    end
+    if settings.allow_saving then
+        imgui.text("Saving is ON. Steam Cloud shares these saves with your normal RE7 install.")
+    else
+        imgui.text("Saving is OFF: progress made in this session will not be kept.")
+    end
+    imgui.text("Last save backup: " .. tostring(kv.lastBackup or "-") .. " (" .. tostring(kv.backups or 0) .. " kept)")
+    if imgui.button("Back up saves now") then send_command("backup manual") end
+
+    if imgui.separator then imgui.separator() end
+    local hchanged, hv = imgui.checkbox("On-screen status", settings.hud)
+    if hchanged then settings.hud = hv save_settings() end
+    imgui.same_line()
+    local nchanged, nv = imgui.checkbox("Nameplate over your friend", settings.nameplate)
+    if nchanged then settings.nameplate = nv save_settings() end
+    if imgui.button("Teleport to my friend") then teleport_to_friend() end
+end
+
+-- Chapter switcher (testing) ---------------------------------------------------------
+-- RE7's own chapter jump: app.GameManager.getChapterJumpDataKey(ChapterNo) names the
+-- jump target, chapterJumpRequest(name, hideLoadingUI, closeName) goes there. A debug
+-- jump can leave story flags oddly set, so it is refused while saving is allowed.
+chapters = { list = nil, last = "-" }
+
+function list_chapter_jumps()
+    local gm = sdk.get_managed_singleton("app.GameManager")
+    local td = sdk.find_type_definition("app.GameManager.ChapterNo")
+    local out = {}
+    if gm == nil or td == nil then chapters.last = "GameManager not ready" return out end
+    for _, f in ipairs(td:get_fields() or {}) do
+        if f:is_static() then
+            local value = safe(f.get_data, f, nil)
+            local key = value ~= nil and safe(gm.call, gm, "getChapterJumpDataKey", value)
+            if key and tostring(key) ~= "" then
+                out[#out + 1] = { name = f:get_name(), value = value, key = tostring(key) }
+            end
+        end
+    end
+    log("chapters: " .. #out .. " jump targets")
+    return out
+end
+
+-- One jump at a time: back-to-back requests while a jump is still loading (21:02,
+-- seven jumps in 50 s) left the game's chapter flow half-switched (cutscenes heard
+-- but not shown, player outside the map). Refuse until the last jump has finished
+-- and the player has been back in control for a while.
+JUMP_SETTLE = 10   -- s of control after a jump before another is allowed
+
+local function jump_busy()
+    local gm = sdk.get_managed_singleton("app.GameManager")
+    if gm and safe(gm.get_field, gm, "RequestChapterJump") then return "a chapter jump is still loading" end
+    if chapters.jump_t and (respawn_t == nil or respawn_t < chapters.jump_t) and os.clock() - chapters.jump_t < 120 then
+        return "waiting for the last jump to finish loading"
+    end
+    if respawn_t and os.clock() - respawn_t < JUMP_SETTLE and chapters.jump_t then
+        return string.format("let the chapter settle (%d s)", math.ceil(JUMP_SETTLE - (os.clock() - respawn_t)))
+    end
+    return nil
+end
+
+function jump_to_chapter(e)
+    local busy = jump_busy()
+    if busy then
+        chapters.last = "not yet: " .. busy
+        log("chapters: refused " .. e.name .. " (" .. busy .. ")")
+        return
+    end
+    if settings.allow_saving then
+        -- A test jump must never be saved over a real save: switch saving off, give
+        -- coop_saveguard (re-reads every 2 s) time to see it, then jump.
+        settings.allow_saving = false
+        save_settings()
+        chapters.pending, chapters.pending_t = e, os.clock() + 2.5
+        chapters.last = "saving switched OFF for the test jump; jumping to " .. e.name .. " in 2 s"
+        log("chapters: " .. chapters.last)
+        return
+    end
+    local gm = sdk.get_managed_singleton("app.GameManager")
+    local ok, err = pcall(gm.call, gm, "chapterJumpRequest(System.String, System.Boolean, System.String)", e.key, false, "")
+    if ok then chapters.jump_t = os.clock() end
+    chapters.last = ok and ("jumping to " .. e.name .. " (" .. e.key .. ")") or ("ERR " .. tostring(err))
+    log("chapters: " .. chapters.last)
+end
+
+re.on_frame(function()
+    if chapters.pending and os.clock() >= chapters.pending_t then
+        local e = chapters.pending
+        chapters.pending = nil
+        jump_to_chapter(e)
+    end
+end)
+
+local function draw_chapter_switcher()
+    if chapters.list == nil or imgui.button("Refresh chapter list") then chapters.list = list_chapter_jumps() end
+    if settings.allow_saving then
+        if imgui.text_colored then
+            imgui.text_colored("Saving is ON: choosing a chapter switches saving OFF first.", 0xFF6B6BFF)
+        else
+            imgui.text("!! Saving is ON: choosing a chapter switches saving OFF first.")
+        end
+    end
+    imgui.text("Jump straight to a chapter (testing only; nothing is saved):")
+    for i, e in ipairs(chapters.list) do
+        if imgui.button(e.name .. "##ch" .. i) then jump_to_chapter(e) end
+        if i % 4 ~= 0 and i < #chapters.list then imgui.same_line() end
+    end
+    if #chapters.list == 0 then imgui.text("(no jump targets reported yet; load into the game and Refresh)") end
+    imgui.text("Current chapter: " .. tostring(local_chapter()) .. "   Last: " .. chapters.last)
+end
+
+-- Floating "RE7 Co-op" window (shown while the REFramework menu is open) ------------
+coop_window = { open = true }
+
+local function section(title, fn)
+    if imgui.collapsing_header then
+        if imgui.collapsing_header(title) then
+            local ok, err = pcall(fn)
+            if not ok then imgui.text("error: " .. tostring(err)) end
+        end
+    elseif imgui.tree_node(title) then
+        local ok, err = pcall(fn)
+        imgui.tree_pop()
+        if not ok then imgui.text("error: " .. tostring(err)) end
+    end
+end
+
+local function draw_testing()
+    if imgui.button("Test with bot") then send_command("bot") end
+    imgui.same_line()
+    if imgui.button("Rebuild Ethan") then pcall(build_ethan) end
+    imgui.same_line()
+    if imgui.button("Teleport to my friend") then teleport_to_friend() end
+    if imgui.button("Reload last save") then request_reload() end
+    imgui.same_line()
+    if reload.running then
+        if imgui.button("Stop reload test") then reload.running = false end
+        imgui.text(string.format("Reload test: round %d/%d, %s, passed %d, failed %d",
+            reload.round, reload.total, reload.stage, reload.pass or 0, reload.fail or 0))
+    elseif imgui.button("Run reload test (10x)") then
+        start_reload_test()
+    end
+    imgui.text(string.format("Ghost rebuilds: %d   stance %s   direction %s   clip %s", ghost_gen,
+        tostring(anim.stance or "-"), tostring(anim.dir or "-"), anim.playing and anim.playing.name or "-"))
+    if imgui.tree_node("Chapter switcher") then
+        local ok, err = pcall(draw_chapter_switcher)
+        imgui.tree_pop()
+        if not ok then log("chapter switcher ERR " .. tostring(err)) end
+    end
+end
+
+re.on_draw_ui(function()
+    local ok, err = pcall(function()
+        local c, v = imgui.checkbox("Show the RE7 Co-op window", coop_window.open)
+        if c then coop_window.open = v end
+    end)
+    if not coop_window.open or not imgui.begin_window then return end
+    -- end_window must run after every begin_window, even if the body fails.
+    if imgui.begin_window("RE7 Co-op", true, 0) then
+        local ok, err = pcall(function()
+            imgui.text("Status: " .. connection_text())
+            section("Connect, saving and display", draw_connect_body)
+            section("Testing", draw_testing)
+            imgui.text("Advanced and debug controls: Script Generated UI > coop_dummy (ghost body test)")
+        end)
+        if not ok and not coop_window.err then coop_window.err = true log("window ERR " .. tostring(err)) end
+    end
+    imgui.end_window()
+end)
+
+-- Warp next to the other player (when you've got separated). Same chapter only.
+function teleport_to_friend()
+    if dummy == nil or #parts == 0 or ghost_hidden then log("teleport: no friend to go to") return end
+    if net.peer_chapter and net.peer_chapter ~= local_chapter() then log("teleport: friend is in another chapter") return end
+    local player = get_player()
+    local mc = player and player:call("getComponent(System.Type)", sdk.typeof("app.MovementController"))
+    if mc == nil then log("teleport: no MovementController") return end
+    local g = dummy:call("get_Transform"):call("get_Position")
+    local pq = player:call("get_Transform"):call("get_Rotation")
+    local ok, err = pcall(mc.call, mc, "warp(via.vec3, via.Quaternion)", Vector3f.new(g.x + 1.0, g.y, g.z), pq)
+    log("teleport: " .. (ok and "warped next to friend" or ("ERR " .. tostring(err))))
 end
 
 local function draw_connect_panel()
@@ -1416,11 +1687,12 @@ function respawn_ghost(reason)
     respawn_t = os.clock()
 end
 
--- During a load RE7 first shows a temporary loading-scene player with no Ethan
--- meshes; don't build a ghost for it, wait for the real one.
+-- Any playable character (Pl0000 Ethan, the videotape characters...). During a
+-- load RE7 first shows a temporary loading-scene player; assemble_from skips any
+-- player without a Shadow body, so that one never gets a ghost.
 local function player_is_ethan(player)
     local name = tostring(safe(player.call, player, "get_Name") or "")
-    return name:find("^Pl0000") ~= nil
+    return name:find("^Pl%d") ~= nil
 end
 
 local watch = { addr = nil, t = 0 }
@@ -1513,15 +1785,35 @@ end)
 -- Hide the ghost when the other player's data stops (disconnect, alt-tab, crash)
 -- and show him again when it resumes.
 NET_TIMEOUT = 2.0
+CUTSCENE_DEBOUNCE = 0.5   -- s an event must run before the ghost hides (no flicker on tiny events)
 ghost_hidden = false
+cutscene_now = false      -- our own cutscene state, also sent to the other player (STANCE_CUTSCENE)
+local cs = { since = nil, check_t = 0 }
 re.on_frame(function()
+    -- Our own cutscene state (checked 10x a second, debounced).
+    local now = os.clock()
+    if now - cs.check_t > 0.1 then
+        cs.check_t = now
+        local running = local_cutscene()
+        if running then cs.since = cs.since or now else cs.since = nil end
+        local want = cs.since ~= nil and (now - cs.since) >= CUTSCENE_DEBOUNCE
+        if want ~= cutscene_now then
+            cutscene_now = want
+            log(string.format("cutscene: %s (%d running events)", want and "started" or "ended", cutscene_events or 0))
+        end
+    end
     if not net.enabled or #parts == 0 then return end
     local last = net.history[#net.history]
-    local stale = (last == nil) or (os.clock() - last.t > NET_TIMEOUT + net.delay)
-    if stale ~= ghost_hidden then
-        ghost_hidden = stale
-        for _, p in ipairs(parts) do pcall(p.go.call, p.go, "set_DrawSelf", not stale) end
-        log(stale and "net: no data for 2 s, ghost hidden" or "net: data resumed, ghost shown")
+    local stale = (last == nil) or (now - last.t > NET_TIMEOUT + net.delay)
+    -- Hide him while we watch a cutscene, and while *they* are in one (their character
+    -- is being moved by their cutscene, which would look odd here).
+    local theirs = anim.flags and (anim.flags & STANCE_CUTSCENE) ~= 0
+    local hide = stale or cutscene_now or theirs
+    if hide ~= ghost_hidden then
+        ghost_hidden = hide
+        for _, p in ipairs(parts) do pcall(p.go.call, p.go, "set_DrawSelf", not hide) end
+        local why = stale and "no data for 2 s" or cutscene_now and "you're in a cutscene" or theirs and "they're in a cutscene" or ""
+        log(hide and ("ghost hidden: " .. why) or "ghost shown")
     end
 end)
 
@@ -1621,7 +1913,12 @@ re.on_frame(function()
     if dummy then
         local p = safe(function() return dummy:call("get_Transform"):call("get_Position") end)
         if p then
-            pcall(draw.world_text, "coop_dummy", p, 0xFF00FFFF)   -- ABGR: yellow
+            -- Nameplate over the other player's head (their Steam name; "Bot" in bot mode).
+            if not ghost_hidden and #parts > 0 and settings and settings.nameplate ~= false then
+                local kv = net.kv or {}
+                local name = (kv.mode == "bot") and "Bot" or ((kv.peerName and kv.peerName ~= "") and kv.peerName or "Friend")
+                pcall(draw.world_text, name, Vector3f.new(p.x, p.y + 2.0, p.z), 0xFFFFFFFF)
+            end
             if frames % 120 == 0 then
                 fs.write("coop_dummy_state.txt", string.format("dummy: %.3f %.3f %.3f", p.x, p.y, p.z))
             end
@@ -1761,6 +2058,53 @@ re.on_frame(function()
     end
 end)
 
+-- On-screen status ------------------------------------------------------------------
+-- A few lines in the top-left corner, visible without opening the REFramework menu:
+-- connection and ping, the friend's chapter when it differs, mod-version trouble,
+-- and whether saving is on.
+local hud = { bad_prev = 0, bad_t = -100, err = false }
+
+local function hud_lines()
+    local kv = net.kv or {}
+    local out = {}
+    local last = net.history[#net.history]
+    local fresh = last ~= nil and (os.clock() - last.t) < (NET_TIMEOUT or 2)
+    local ping = net.ping and string.format(" - %d ms", math.floor(net.ping * 1000 + 0.5)) or ""
+    if kv.mode == "bot" then
+        out[#out + 1] = { "Co-op: bot test" .. ping, 0xFFFFD27F }
+    elseif kv.mode == "steam" and (kv.peer == nil or kv.peer == "steam:0") then
+        out[#out + 1] = { "Co-op: not connected (Insert > coop_dummy > Connect)", 0xFF9EB7FF }
+    elseif fresh then
+        local who = (kv.peerName and kv.peerName ~= "") and kv.peerName or "your friend"
+        out[#out + 1] = { "Co-op: connected to " .. who .. ping, 0xFF7FFF8C }
+    else
+        out[#out + 1] = { "Co-op: waiting for your friend...", 0xFF7FE6FF }
+    end
+    if fresh and anim.flags and (anim.flags & STANCE_CUTSCENE) ~= 0 then
+        out[#out + 1] = { "Friend is watching a cutscene", 0xFF7FE6FF }
+    end
+    if fresh and net.peer_chapter and net.peer_chapter ~= local_chapter() then
+        out[#out + 1] = { string.format("Friend is in another chapter (%d, you're in %d)", net.peer_chapter, local_chapter()), 0xFF7FE6FF }
+    end
+    -- Packets we can't decode usually mean the other player runs another mod version.
+    local bad = tonumber(kv.bad or 0) or 0
+    if bad > hud.bad_prev then hud.bad_t = os.clock() end
+    hud.bad_prev = bad
+    if os.clock() - hud.bad_t < 10 then
+        out[#out + 1] = { "Friend's packets don't match: check you both have the same coop-re7 version", 0xFF6B6BFF }
+    end
+    out[#out + 1] = { settings.allow_saving and "Saving: on (backed up)" or "Saving: off", 0xFFBFBFBF }
+    return out
+end
+
+re.on_frame(function()
+    if not (settings and settings.hud) then return end
+    local ok, err = pcall(function()
+        for i, l in ipairs(hud_lines()) do draw.text(l[1], 16, 16 + (i - 1) * 18, l[2]) end
+    end)
+    if not ok and not hud.err then hud.err = true log("hud ERR " .. tostring(err)) end
+end)
+
 -- Player-vs-ghost collision ------------------------------------------------------
 -- The other player's own game keeps them out of walls; here we only stop the
 -- local player walking through the ghost. If we overlap a capsule around him,
@@ -1775,7 +2119,11 @@ re.on_frame(function()
     if not (collide.enabled and follow and dummy) or #parts == 0 then return end
     local ok, err = pcall(function()
         local player = get_player()
-        if player == nil then return end
+        if player == nil or ghost_hidden then return end
+        -- Only push while the local player is actually walking: never during
+        -- cutscenes, loads or scripted moves (a warp there can strand the player).
+        local pm = player_movement(player)
+        if pm == nil or not safe(pm.call, pm, "get_isMove") then return end
         local ptr = player:call("get_Transform")
         local p = ptr:call("get_Position")
         local g = dummy:call("get_Transform"):call("get_Position")

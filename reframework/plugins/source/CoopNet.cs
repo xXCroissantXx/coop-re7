@@ -59,6 +59,8 @@ public class CoopNet
         public bool botStanceCycle { get; set; } = true;
         public double botStanceEvery { get; set; } = 16.0;
         public double botTurnRateDeg { get; set; } = 240;   // facing changes turn, not snap
+        public int botChapter { get; set; } = -1;            // -1: same chapter as us; else fake "other chapter"
+        public int saveBackupsKeep { get; set; } = 20;
         public double botJogSpeed { get; set; } = 3.4;
         public double botCrouchSpeed { get; set; } = 0.9;
         public double simLatencyMs { get; set; } = 80;
@@ -81,6 +83,7 @@ public class CoopNet
         static readonly Random s_rng = new Random();
         static readonly List<(double due, byte[] pkt)> s_inFlight = new List<(double, byte[])>();
         public static string Expect = "-";
+        public static Sample LastLocal;   // newest local sample, so the bot can echo it like a real peer
 
         static int Stance(Config c, double now) =>
             c.botStanceCycle ? (int)(now / Math.Max(1, c.botStanceEvery)) % 3 : 0;
@@ -92,10 +95,21 @@ public class CoopNet
             _ => c.botSpeed,
         };
 
+        // The bot circles where we stand. Re-centre when we change chapter or end up far
+        // from the circle (load, chapter jump, teleport); otherwise it kept circling the
+        // old chapter's coordinates, outside the new map.
+        static uint s_centerChapter;
         public static void SetCenter(Sample local)
         {
-            if (s_haveCenter) return;
+            if (s_haveCenter)
+            {
+                double dx = local.Px - s_cx, dz = local.Pz - s_cz;
+                bool far = Math.Sqrt(dx * dx + dz * dz) > 30.0 || Math.Abs(local.Py - s_cy) > 10.0;
+                if (local.Id == s_centerChapter && !far) return;
+                API.LogInfo($"[CoopNet] bot re-centred ({(far ? "player moved far" : "chapter changed")})");
+            }
             s_cx = local.Px; s_cy = local.Py; s_cz = local.Pz;
+            s_centerChapter = local.Id;
             s_haveCenter = true;
         }
 
@@ -143,6 +157,10 @@ public class CoopNet
             s.Qx = 0; s.Qy = (float)Math.Sin(yaw / 2); s.Qz = 0; s.Qw = (float)Math.Cos(yaw / 2);
             // Same flags as Lua's local_stance_flags: bit0 crouch, bit1 walking, bit2 valid.
             s.Bank = 4u | (stance == 2 ? 1u : 0u) | (stance == 0 ? 2u : 0u);
+            // Chapter (same as ours unless faked) and the ping echo: like a real peer,
+            // send back the newest sender time we've seen from the other side, mod 1000 s.
+            s.Id = c.botChapter >= 0 ? (uint)c.botChapter : LastLocal.Id;
+            s.Frame = (float)(LastLocal.T % 1000.0);
             // Look around like a player: slow sweep left/right, gentle up/down.
             s.LookYaw = (float)(0.9 * Math.Sin(now * 0.7));
             s.LookPitch = (float)(0.35 * Math.Sin(now * 0.45));
@@ -175,6 +193,11 @@ public class CoopNet
         [DllImport(Dll)] static extern IntPtr SteamAPI_SteamFriends_v017();
         [DllImport(Dll)] static extern ulong SteamAPI_ISteamUser_GetSteamID(IntPtr self);
         [DllImport(Dll)] static extern IntPtr SteamAPI_ISteamFriends_GetPersonaName(IntPtr self);
+        [DllImport(Dll)] static extern IntPtr SteamAPI_ISteamFriends_GetFriendPersonaName(IntPtr self, ulong steamId);
+        [DllImport(Dll)] static extern void SteamAPI_ISteamFriends_RequestUserInformation(IntPtr self, ulong steamId,
+            [MarshalAs(UnmanagedType.I1)] bool requireNameOnly);
+        [DllImport(Dll)] [return: MarshalAs(UnmanagedType.I1)]
+        static extern bool SteamAPI_ISteamUser_GetUserDataFolder(IntPtr self, byte[] buffer, int bufferSize);
         [DllImport(Dll)] static extern void SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess(IntPtr self);
         [DllImport(Dll)] static extern int SteamAPI_ISteamNetworkingUtils_GetRelayNetworkStatus(IntPtr self, IntPtr details);
         [DllImport(Dll)] static extern void SteamAPI_SteamNetworkingIdentity_Clear(IntPtr self);
@@ -188,7 +211,8 @@ public class CoopNet
         static extern bool SteamAPI_ISteamNetworkingMessages_AcceptSessionWithUser(IntPtr self, IntPtr identity);
         [DllImport(Dll)] static extern void SteamAPI_SteamNetworkingMessage_t_Release(IntPtr msg);
 
-        static IntPtr s_msgs, s_utils, s_peerIdentity;
+        static IntPtr s_msgs, s_utils, s_peerIdentity, s_friends, s_user;
+        static ulong s_peerId;
         static int s_channel;
         static readonly IntPtr[] s_inbox = new IntPtr[32];
         public static ulong SelfId;
@@ -204,6 +228,7 @@ public class CoopNet
             if (s_msgs == IntPtr.Zero || s_utils == IntPtr.Zero || user == IntPtr.Zero)
                 throw new InvalidOperationException("Steam interfaces unavailable (is Steam running?)");
             SelfId = SteamAPI_ISteamUser_GetSteamID(user);
+            (s_friends, s_user) = (friends, user);
             if (friends != IntPtr.Zero) SelfName = Marshal.PtrToStringUTF8(SteamAPI_ISteamFriends_GetPersonaName(friends)) ?? "?";
             SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess(s_utils);
 
@@ -212,10 +237,30 @@ public class CoopNet
             SteamAPI_SteamNetworkingIdentity_Clear(s_peerIdentity);
         }
 
+        // Friend's Steam name for the nameplate; Steam may need a moment to fetch it.
+        public static string PeerName()
+        {
+            if (s_friends == IntPtr.Zero || s_peerId == 0) return "";
+            var name = Marshal.PtrToStringUTF8(SteamAPI_ISteamFriends_GetFriendPersonaName(s_friends, s_peerId)) ?? "";
+            return name == "[unknown]" ? "" : name;
+        }
+
+        // ...\Steam\userdata\<id>\418370\local; the game's saves sit in the sibling "remote".
+        public static string UserDataFolder()
+        {
+            if (s_user == IntPtr.Zero) return null;
+            var buf = new byte[1024];
+            if (!SteamAPI_ISteamUser_GetUserDataFolder(s_user, buf, buf.Length)) return null;
+            int n = Array.IndexOf(buf, (byte)0);
+            return Encoding.UTF8.GetString(buf, 0, n < 0 ? buf.Length : n);
+        }
+
         public static void SetPeer(ulong peer)
         {
             SteamAPI_SteamNetworkingIdentity_Clear(s_peerIdentity);
+            s_peerId = peer;
             if (peer == 0) return;
+            if (s_friends != IntPtr.Zero) SteamAPI_ISteamFriends_RequestUserInformation(s_friends, peer, true);
             SteamAPI_SteamNetworkingIdentity_SetSteamID64(s_peerIdentity, peer);
             SteamAPI_ISteamNetworkingMessages_AcceptSessionWithUser(s_msgs, s_peerIdentity);
         }
@@ -264,6 +309,7 @@ public class CoopNet
         public float LookYaw, LookPitch;   // camera relative to body, radians
     }
 
+    const string Version = "0.3";
     const int PacketSize = 64;
     static readonly byte[] Magic = { (byte)'R', (byte)'7', (byte)'C', (byte)'2' };
     const int KeepSamples = 32;
@@ -297,6 +343,7 @@ public class CoopNet
             // SteamID and switch to a friend live, even from bot mode.
             try { Steam.Init(s_cfg.steamChannel); s_steamReady = true; }
             catch (Exception e) { API.LogWarning("[CoopNet] Steam unavailable: " + e.Message); }
+            if (s_steamReady) BackupSaves("launch");   // a fresh copy every time the mod starts
 
             if (IsSteam)
             {
@@ -373,6 +420,13 @@ public class CoopNet
             s_cfg.mode = "bot";
             s_lastCommand = "bot test";
         }
+        else if (parts.Length == 2 && parts[0] == "backup")
+        {
+            BackupSaves(parts[1]);
+            s_lastCommand = "save backup (" + parts[1] + ")";
+            WriteStatus("running");
+            return;   // nothing else changes
+        }
         else
         {
             s_lastCommand = "rejected: " + cmd;
@@ -383,6 +437,42 @@ public class CoopNet
         SaveConfig();
         API.LogInfo("[CoopNet] command: " + s_lastCommand);
         WriteStatus("running");
+    }
+
+    // Save backups ------------------------------------------------------------------
+    // Copies the game's Steam save folder (userdata\<id>\418370\remote) into
+    // reframework/data/save_backups/<stamp>_<reason>/, keeping the newest N. Runs at
+    // every plugin start and on the "backup" command (sent when saving is allowed).
+    static string s_lastBackup = "-";
+    static int s_backupCount;
+
+    static void BackupSaves(string reason)
+    {
+        try
+        {
+            var local = Steam.UserDataFolder();
+            if (string.IsNullOrEmpty(local)) { s_lastBackup = "no Steam user folder"; return; }
+            var remote = Path.Combine(Path.GetDirectoryName(local.TrimEnd('\\', '/')), "remote");
+            if (!Directory.Exists(remote)) { s_lastBackup = "no save folder yet"; return; }
+            var root = Path.Combine(s_dataDir, "save_backups");
+            var dest = Path.Combine(root, $"{DateTime.Now:yyyyMMdd_HHmmss}_{reason}");
+            int files = 0;
+            foreach (var src in Directory.GetFiles(remote, "*", SearchOption.AllDirectories))
+            {
+                var rel = Path.GetRelativePath(remote, src);
+                var to = Path.Combine(dest, rel);
+                Directory.CreateDirectory(Path.GetDirectoryName(to));
+                File.Copy(src, to, true);
+                files++;
+            }
+            var all = Directory.GetDirectories(root);
+            Array.Sort(all, StringComparer.Ordinal);
+            for (int i = 0; i < all.Length - Math.Max(1, s_cfg.saveBackupsKeep); i++) Directory.Delete(all[i], true);
+            s_backupCount = Math.Min(all.Length, Math.Max(1, s_cfg.saveBackupsKeep));
+            s_lastBackup = $"{DateTime.Now:HH:mm:ss} {reason} ({files} files)";
+            API.LogInfo("[CoopNet] save backup: " + dest + " (" + files + " files)");
+        }
+        catch (Exception e) { s_lastBackup = "FAILED: " + e.Message; API.LogWarning("[CoopNet] save backup failed: " + e); }
     }
 
     static void SaveConfig()
@@ -459,6 +549,7 @@ public class CoopNet
                     else if (s_cfg.mode == "bot")
                     {
                         Bot.SetCenter(s);   // the bot circles where we first stood
+                        Bot.LastLocal = s;
                     }
                     else
                     {
@@ -526,8 +617,8 @@ public class CoopNet
             if (s_cfg.mode == "bot") text += $"botExpect={Bot.Expect}\n";
             if (s_steamReady)
                 text += $"steamSelf={Steam.SelfId}\nsteamName={Steam.SelfName}\nrelayStatus={Steam.RelayStatus()}\n";
-            if (IsSteam) text += $"lastSendResult={Steam.LastSendResult}\n";
-            text += $"lastCommand={s_lastCommand}\n";
+            if (IsSteam) text += $"lastSendResult={Steam.LastSendResult}\npeerName={Steam.PeerName()}\n";
+            text += $"lastCommand={s_lastCommand}\nlastBackup={s_lastBackup}\nbackups={s_backupCount}\nversion={Version}\n";
         }
         WriteStatusSafe(text);
     }

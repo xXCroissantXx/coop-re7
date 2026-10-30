@@ -1,80 +1,80 @@
-# RE7 co-op prototype v0.1: setup for both players
+# coop-re7: online co-op for Resident Evil 7 (prototype, v0.3)
 
-This is an **early prototype**. Each player sees the other as a "ghost": a full-body **Ethan** that walks,
-jogs and sidesteps where the other player moves. Nothing else is shared yet: no enemies, items, doors or story.
-It was tested in the **Chapter 1 start area** (outside the Baker guest house).
+Play Resident Evil 7 with a friend over the internet. Each of you sees the other as a full-body **Ethan** who
+walks, jogs, crouches, sidesteps and looks around where they do, over Steam (no port forwarding).
 
-Both players do every step below.
+**What's shared today:** where each player is and what they're doing (movement, stance, looking, which chapter).
+**Not shared yet:** enemies, items, doors and story. Each player plays their own copy of the world.
 
-## What you need
-- Resident Evil 7 biohazard **on Steam**, fully updated (the current build, with ray tracing).
-- Windows with the **.NET 10 runtime** (desktop or core). Check with `dotnet --list-runtimes`; you need a line with
-  `Microsoft.NETCore.App 10.`. Get it from https://dotnet.microsoft.com/download/dotnet/10.0.
-- Each player's **SteamID64**, a 17-digit number starting with 7656… Steam shows it under
-  *Account details*, and the plugin also writes yours to `reframework/data/coopnet_status.txt` (`steamSelf=`).
+Made with [coop-anything](https://github.com/cranebeaker/coop-anything). MIT licensed.
 
-## 1. Make a test copy of the game (recommended)
-Copy `steamapps/common/RESIDENT EVIL 7 biohazard` (about 64 GB) to another folder and play from the copy.
-Your real install stays untouched.
-Create `steam_appid.txt` containing `418370` in the copy so it launches outside Steam's library.
+## Install (both players)
 
-**Back up your saves first.** They are in `Steam/userdata/<your id>/418370/remote/win64_save/`.
-The copy and the real install share these save files through Steam Cloud. The included save guard blocks all
-saving while the mod runs, but back up anyway.
+1. Have **Resident Evil 7 biohazard on Steam**, fully updated.
+2. Download this repo (**Code → Download ZIP**) and unzip it anywhere.
+3. Double-click **Install.cmd**. It will:
+   - find RE7 in your Steam libraries and **copy it** to `Documents\RE7-coop` (your normal install is not
+     changed; the copy needs about 65 GB of free space);
+   - download **REFramework** and its C# add-on from the official release and **check each file's SHA-256**;
+   - install the co-op files, back up your saves, and put a **Start RE7 Co-op** shortcut on your desktop.
+4. If the installer says **.NET 10 runtime not found**, install ".NET Runtime 10" (Windows x64) from
+   https://dotnet.microsoft.com/download/dotnet/10.0 and run Install.cmd again.
 
-## 2. Install REFramework (official downloads, check the hashes)
-From https://github.com/praydog/REFramework-nightly/releases, release **nightly-01433**
-(commit d4611aef1d63effd3a736bdf9404ea702428017d):
+Updating to a newer version: unzip the new version and run Install.cmd again. It reuses your co-op folder
+when it finds one, keeps your friend's SteamID, and replaces only the mod files.
 
-| File | SHA-256 |
+## Play
+
+1. Start Steam, then **Start RE7 Co-op** (desktop shortcut). Load a save in **Chapter 1** (the start area
+   outside the guest house); be roughly in the same spot.
+2. Press **Insert**. A **RE7 Co-op** window opens next to the REFramework menu. Expand
+   **Connect, saving and display**.
+3. Click **Copy** next to *Your SteamID* and send it to your friend. Paste **theirs** into *Friend's SteamID*
+   and click **Connect to friend**. Both of you do this.
+4. The top-left corner shows **Co-op: connected to <name> - <ping> ms** once their data arrives, and they appear
+   as Ethan with their name over their head.
+
+Your friend's ID is saved, so next time it reconnects by itself.
+
+**Tip: start together.** Both open **Testing → Chapter switcher** in the RE7 Co-op window and jump to the
+same chapter (for example **Chapter3**). You both start at exactly the same spot, and it loads much faster
+than Continue. Nothing from a jump is saved (the switcher turns saving off first).
+
+### Options (RE7 Co-op window)
+
+| Option | What it does |
 |---|---|
-| `REFramework.zip` | `b3ff4f497be6f108ef494c2c02156b61b8d04f3171378ecc0dc28c218ee296b3` |
-| `csharp-api.zip` | `87a909fedbec028ccd7017cc1dfb671d9f4206f07520bcb114fc6ecd74e8629b` |
+| **Allow saving** | Off by default: nothing you do is saved. Turn on to save normally. Your save folder is backed up automatically (at every launch and when you turn this on; the last 20 backups are kept in `reframework\data\save_backups`). The co-op copy shares Steam Cloud saves with your normal RE7. |
+| **Back up saves now** | An extra backup on demand. |
+| **On-screen status** | The top-left status lines (connection, ping, chapter, saving). |
+| **Nameplate over your friend** | Their Steam name above their Ethan. |
+| **Teleport to my friend** | Jump next to them if you got separated (same chapter only). |
+| **Test with bot** | A fake player walks around you (walking, jogging, crouching, in every direction), to try everything alone. |
+| **Chapter switcher** (Testing) | Jump straight to any chapter. For testing; saving is switched off first. |
+| **Rebuild Ethan** / **Reload last save** (Testing) | Fix a broken-looking ghost / reload your save (what Continue does). |
 
-Check a hash in PowerShell with `Get-FileHash .\REFramework.zip -Algorithm SHA256`.
+## Known limits
 
-- From `REFramework.zip`, copy **only `dinput8.dll`** into the game copy's folder.
-- Extract all of `csharp-api.zip` into the game copy's folder (it adds `reframework/plugins/...`).
-
-## 3. Install the co-op files from this kit
-Copy this kit's `reframework` folder into the game copy's folder (merge it). It contains:
-- `reframework/autorun/coop_saveguard.lua`: blocks all game saving while the mod runs
-- `reframework/autorun/coop_dummy.lua`: spawns and animates the ghost
-- `reframework/autorun/coop_probe.lua`: small debug helper
-- `reframework/plugins/source/CoopNet.cs`: networking over Steam
-- `reframework/data/coopnet_config.json`: settings (see the next step)
-
-## 4. Connect to each other (in game)
-1. Start the game copy and load your save.
-2. Press **Insert** and open **Script Generated UI → coop_dummy (ghost body test) → Connect**.
-3. Click **Copy** next to *Your SteamID* and send it to the other player (Discord, Steam chat…).
-4. Paste **their** SteamID into *Friend's SteamID* and click **Connect to friend**.
-
-Both players do this. The status line changes to **Connected to your friend** once their data arrives.
-Your friend's ID is saved, so next time it reconnects by itself. No port forwarding is needed: traffic goes
-through Valve's relay. **Test with bot** switches to a fake player if you want to try things alone.
-
-## 5. Play
-1. Start Steam, then run `re7.exe` from the game copy.
-2. Load a save in **Chapter 1** (the start area outside the guest house). Both players should be in the same area.
-3. That's it. About 10 seconds after you can move, the other player appears as a full-body **Ethan** who walks,
-   jogs, sidesteps and looks around where they do. Nothing needs clicking.
-
-To check the connection, press **Insert** and open **Script Generated UI → coop_dummy (ghost body test)**. The
-`CoopNet:` line shows `sent=`/`recv=`; both should climb on both PCs, and `relayStatus=100` means Steam's
-relay is ready. **Rebuild Ethan** redoes the ghost if he ever looks wrong. Infected Mia and other models are
-under **Other characters (debug)**.
-
-## Known limits (v0.1)
-- The ghost is built from Ethan's own shadow body. It's only tested in Chapter 1, and his head and face don't animate yet.
-- Nothing else syncs: enemies, items, doors, story, damage. Each player plays their own world.
-- Saving is blocked while the mod runs.
-- The ghost's position is only meaningful while both players are in the same area.
+- Only position, movement, stance, looking and chapter are shared. Enemies, items, doors and story are separate.
+- You only see your friend while both of you are playing as Ethan (not in Mia's or other characters' sections).
+- Tested on one PC against a simulated player; a real two-player session hasn't been verified yet.
 
 ## Troubleshooting
-- `relayStatus` not 100: Steam's relay is still connecting. Wait a few seconds; check that Steam is online.
-- `sent` climbs but `recv` stays 0: check that the *other* player put *your* SteamID in their config, and that both
-  are running the mod.
-- The ghost's label moves but the body doesn't: wait for the 3 s/0.15 s delay, or click **WALK** on the Walk clip.
-- Reset scripts (Insert → ScriptRunner → Reset scripts) reloads the Lua parts. The C# plugin reloads itself
-  when `CoopNet.cs` is saved.
+
+| What you see | Try |
+|---|---|
+| "Waiting for your friend" on both sides | Each of you must paste the *other* person's SteamID and click Connect |
+| "Friend's packets don't match" | You're on different coop-re7 versions; both install the same release |
+| "Friend is in another chapter" | Load into the same chapter |
+| Their label moves but no body | Wait a few seconds, or press **Rebuild Ethan** in the coop_dummy menu |
+
+Logs for bug reports: `reframework\data\coopnet_status.txt` and `reframework\data\coop_dummy_log.txt` in
+your co-op folder. `coopnet_status.txt` contains your SteamID and Steam name; remove them before posting
+publicly.
+
+## How it works
+
+REFramework Lua scripts build the other player from Ethan's own full-body "shadow" model (RE7 renders it only
+for the player's shadow) and animate it with his own animations. A C# plugin sends 30 small updates a second
+over Steam's relay network (`ISteamNetworkingMessages`). Details and everything learned along the way are in
+[docs/NOTES.md](docs/NOTES.md) and the coop-anything write-up `games/resident-evil-7`.
