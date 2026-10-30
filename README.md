@@ -44,13 +44,15 @@ Copy this kit's `reframework` folder into the game copy's folder (merge it). It 
 - `reframework/plugins/source/CoopNet.cs`: networking over Steam
 - `reframework/data/coopnet_config.json`: settings (see the next step)
 
-## 4. Put the other player's SteamID in the config
-Edit `reframework/data/coopnet_config.json` and set `peerSteamId` to the **other player's** SteamID64:
-```json
-"mode": "steam",
-"peerSteamId": "7656119XXXXXXXXXX"
-```
-Each player enters the *other* player's ID. No port forwarding is needed: traffic goes through Valve's relay.
+## 4. Connect to each other (in game)
+1. Start the game copy and load your save.
+2. Press **Insert** and open **Script Generated UI → coop_dummy (ghost body test) → Connect**.
+3. Click **Copy** next to *Your SteamID* and send it to the other player (Discord, Steam chat…).
+4. Paste **their** SteamID into *Friend's SteamID* and click **Connect to friend**.
+
+Both players do this. The status line changes to **Connected to your friend** once their data arrives.
+Your friend's ID is saved, so next time it reconnects by itself. No port forwarding is needed: traffic goes
+through Valve's relay. **Test with bot** switches to a fake player if you want to try things alone.
 
 ## 5. Play
 1. Start Steam, then run `re7.exe` from the game copy.

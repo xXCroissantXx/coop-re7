@@ -397,6 +397,42 @@ Spawn through `via.Prefab` (`sdk.create_resource("via.Prefab", path)` â†’ h
 - API: `app.MovementController.warp(via.vec3, via.Quaternion)` moves the player through RE7's movement controller (setting the transform directly would be undone by the character controller). There's also `app.PlayerOrder.setPositionWithCamera(via.vec3)`.
 - Implementation (installed 19:24, untested): a horizontal capsule test every frame, COLLIDE_RADIUS 0.6 m combined and COLLIDE_HEIGHT 1.7 m. When overlapping, warp the player out along the ghostâ†’player line by the overlap, keeping rotation. Menu checkbox with a push counter (default on); the first push is logged.
 
+## Session robustness + reload test (installed 19:50, untested)
+- `respawn_ghost(reason)`: destroys parts and the dummy, resets anim, look and candidates, sets phase back to "wait", bumps `ghost_gen`.
+  - It's triggered by a watcher every 0.5 s when the PlayerObj address changes (load, death, area change), or when the ghost's first part no longer answers get_Name (folder unloaded).
+- Disconnect: ghost hidden (DrawSelf false) when the newest network sample is older than NET_TIMEOUT 2 s + delay; shown again when data resumes.
+- Reload test (menu "Tests"): `request_reload()` calls `SaveDataManager.loadFileAutoRequest(LoadSlotNo or SaveSlotNo, false, false, false)`, i.e. what Continue does; read-only, and saves stay blocked.
+  - 10 rounds, one every 45 s. PASS = ghost_gen rose, â‰¥5 parts, a clip bound after the load (`anim.bound_t`), and the network seq rose with the ghost not hidden. Timeout 90 s. Results in `reframework/data/coop_reload_test.txt`.
+- Saves before the test match the 14:49 backup (hashes snapshot in `local/save_hashes_before_reload_test.txt`).
+- **Run 1 (19:47â€“20:09): 5 PASS / 5 FAIL. All failures were the test's 90 s timeout, not the mod.**
+  - Every round rebuilt the ghost and the network kept flowing.
+  - **Saves were byte-identical afterwards**; 1 autosave attempt was blocked.
+  - Timeline per round: `loadFileAutoRequest(slot 0)` â†’ **the player immediately becomes a temporary loading-scene player** at (72.9, 29.4, 26.0) (the Pl2000/Chapter0 spot, no Ethan meshes, so "build Ethan: no Ethan mesh") â†’ **the real player appears about 80 s later** â†’ **Ethan is fully rebuilt and animating 7â€“8 s after that**.
+  - Fixes: timeout 180 s; PASS lines report load time and ghost-back time separately; no ghost is spawned unless the player's name starts with `Pl0000` (Ethan). Known limit: chapters played as other characters (e.g. Mia) get no ghost until handled.
+
+## In-game Connect panel (installed 20:15, untested)
+- The owner skipped the reload rerun ("chapter 1 loading scene takes too long"). The rebuild path itself was proven (7â€“8 s after the real player appears).
+- CoopNet.cs:
+  - Steam initialises in **every** mode (own SteamID and relay status are always in the status file).
+  - `PollCommand()` reads `reframework/data/coopnet_command.txt` once per IO tick. `steam <SteamID64>` (validated > 76561197960265728) switches to Steam and sets the peer live; `bot` switches to the bot.
+  - Old samples are cleared on a switch; the config is saved (`SaveConfig`) so the next launch reconnects; `lastCommand` goes in the status.
+  - UDP/echo are config-only (they'd need socket rebuilds).
+- coop_dummy.lua: a "Connect" tree at the top of the menu, open on first draw:
+  - status text (Bot test / Not connected / Waiting for your friend / Connected, from network freshness);
+  - your SteamID + Copy (`sdk.copy_to_clipboard`);
+  - friend ID input (17 digits starting 7656119), Connect, Test with bot.
+  - The body is pcall'd inside the tree so `tree_pop` always runs.
+- Kit README step 4 now uses the panel instead of editing JSON.
+- Verified after hot-reload: bot mode with Steam up (`relayStatus=100`, steamSelf present).
+- **20:18: the owner confirmed "Panel works".**
+
+## Published (2026-10-29)
+- Mod repo (MIT): https://github.com/xXCroissantXx/coop-re7, initial commit 607e7c6. It contains the kit's reframework/ files, README, LICENSE and docs/NOTES.md (a scrubbed copy of this file, with local paths replaced). Built from `<publish folder>`.
+- Hub contribution: fork xXCroissantXx/coop-anything, branch `game/resident-evil-7` cut from upstream 3dbf6dd, commit 547b864. **Draft PR https://github.com/cranebeaker/coop-anything/pull/257** (mergeable, no CI checks reported yet).
+  - Changes: the directory entry (qa none, status prototype, steam-relay), regenerated DIRECTORY.md, the RE Engine playbook row, and games/resident-evil-7/README.md.
+  - Re-applied to the fresh upstream by `local/build/apply_hub_changes.py`.
+- Tooling: GitHub CLI 2.103.3 portable in %LOCALAPPDATA%\Programs\gh (verified against the release checksums; the MSI got stuck on 1618). Git 2.56 via winget. gh is logged in as the owner, with commits under their noreply address.
+
 ## Next phases (not started)
 - Phase 4, Choose: likely host-authoritative. The host runs the world and enemies, and the client sends input and pose. Transport: Steam networking (relay) via a native REFramework plugin, since Lua has no sockets.
 - Hard problems to expect: a single-protagonist game (the second player needs a puppet or ghost actor), scripted chases (Jack), cutscenes, item and key progression sync, and the save system.

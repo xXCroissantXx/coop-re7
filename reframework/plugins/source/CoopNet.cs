@@ -293,12 +293,17 @@ public class CoopNet
             s_cfg = LoadConfig();
             s_running = true;
 
+            // Steam starts in every mode so the in-game Connect panel can show our own
+            // SteamID and switch to a friend live, even from bot mode.
+            try { Steam.Init(s_cfg.steamChannel); s_steamReady = true; }
+            catch (Exception e) { API.LogWarning("[CoopNet] Steam unavailable: " + e.Message); }
+
             if (IsSteam)
             {
-                Steam.Init(s_cfg.steamChannel);
+                if (!s_steamReady) throw new InvalidOperationException("steam mode but Steam is unavailable");
                 var want = (s_cfg.peerSteamId ?? "").Trim();
                 s_peerSteam = want == "self" ? Steam.SelfId          // loopback experiment
-                    : want.Length > 0 ? ulong.Parse(want, Inv) : 0;  // 0: just show our own id
+                    : ulong.TryParse(want, NumberStyles.None, Inv, out var id) ? id : 0;  // 0: just show our own id
                 Steam.SetPeer(s_peerSteam);
                 API.LogInfo($"[CoopNet] steam self={Steam.SelfId} ({Steam.SelfName}) peer={s_peerSteam}");
             }
@@ -341,6 +346,50 @@ public class CoopNet
     }
 
     static ulong s_peerSteam;
+    static bool s_steamReady;
+    static string s_lastCommand = "-";
+
+    // In-game Connect panel: Lua writes one line to coopnet_command.txt
+    // ("steam <SteamID64>" or "bot"); applied here live and saved to the config.
+    static void PollCommand()
+    {
+        var path = Path.Combine(s_dataDir, "coopnet_command.txt");
+        if (!File.Exists(path)) return;
+        string cmd;
+        try { cmd = File.ReadAllText(path).Trim(); File.Delete(path); }
+        catch (IOException) { return; }
+        var parts = cmd.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 2 && parts[0] == "steam" && s_steamReady &&
+            ulong.TryParse(parts[1], NumberStyles.None, Inv, out var id) && id > 76561197960265728UL)
+        {
+            s_cfg.mode = "steam";
+            s_cfg.peerSteamId = parts[1];
+            s_peerSteam = id;
+            Steam.SetPeer(id);
+            s_lastCommand = "connected to " + parts[1];
+        }
+        else if (parts.Length == 1 && parts[0] == "bot")
+        {
+            s_cfg.mode = "bot";
+            s_lastCommand = "bot test";
+        }
+        else
+        {
+            s_lastCommand = "rejected: " + cmd;
+            WriteStatus("running");
+            return;
+        }
+        lock (s_lock) { s_received.Clear(); s_inDirty = true; }   // drop the old peer's samples
+        SaveConfig();
+        API.LogInfo("[CoopNet] command: " + s_lastCommand);
+        WriteStatus("running");
+    }
+
+    static void SaveConfig()
+    {
+        var path = Path.Combine(s_dataDir, "coopnet_config.json");
+        File.WriteAllText(path, JsonSerializer.Serialize(s_cfg, new JsonSerializerOptions { WriteIndented = true }));
+    }
     static bool IsSteam => s_cfg != null && s_cfg.mode == "steam";
     static string PeerText => IsSteam ? $"steam:{s_peerSteam}" : s_peer?.ToString() ?? "-";
 
@@ -417,6 +466,7 @@ public class CoopNet
                         s_sent++;
                     }
                 }
+                PollCommand();
                 if (IsSteam) Steam.Poll((data, from) => OnPacket(data, "steam:" + from));
                 if (s_cfg.mode == "bot") { Bot.Tick(s_cfg, pkt => OnPacket(pkt, "bot")); s_sent++; }
                 WriteInFileIfDirty(inPath);
@@ -474,9 +524,10 @@ public class CoopNet
             text = $"state={state}\nmode={s_cfg.mode}\npeer={PeerText}\nsent={s_sent}\nrecv={s_recv}\nbad={s_bad}\nlastFrom={s_lastFrom}\n" +
                    $"time={DateTime.Now:HH:mm:ss}\n";
             if (s_cfg.mode == "bot") text += $"botExpect={Bot.Expect}\n";
-            if (IsSteam)
-                text += $"steamSelf={Steam.SelfId}\nsteamName={Steam.SelfName}\nrelayStatus={Steam.RelayStatus()}\n" +
-                        $"lastSendResult={Steam.LastSendResult}\n";
+            if (s_steamReady)
+                text += $"steamSelf={Steam.SelfId}\nsteamName={Steam.SelfName}\nrelayStatus={Steam.RelayStatus()}\n";
+            if (IsSteam) text += $"lastSendResult={Steam.LastSendResult}\n";
+            text += $"lastCommand={s_lastCommand}\n";
         }
         WriteStatusSafe(text);
     }

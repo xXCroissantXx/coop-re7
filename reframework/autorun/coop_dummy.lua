@@ -364,7 +364,11 @@ local function net_io()
     if now - net.last_status > 1 then
         net.last_status = now
         local st = fs.read("coopnet_status.txt")
-        if st then net.stats = st:gsub("\n", "  ") end
+        if st then
+            net.stats = st:gsub("\n", "  ")
+            net.kv = {}
+            for k, v in st:gmatch("(%w+)=([^\n]*)") do net.kv[k] = v end
+        end
     end
 end
 
@@ -789,6 +793,7 @@ local function verify_playback()
     if endf > 0 then
         anim.retries = 0
         anim.fail_streak = 0
+        anim.bound_t = os.clock()   -- a clip really bound and is advancing (reload test reads this)
         -- Leave the dummy's MotionFsm/app.MotionManager enabled: disabling them
         -- froze the layer (frame stuck at 0.2889 for 13 s, 2026-10-29 16:17).
         -- In RE7 app.MotionManager drives the Motion update.
@@ -1179,8 +1184,67 @@ local function set_motion_enabled(on)
     if m then safe(m.call, m, "set_Enabled", on) end
 end
 
+-- Connect panel: no config editing. Writes a one-line command that CoopNet.cs
+-- applies live ("steam <SteamID64>" or "bot") and saves for next launch.
+connect_ui = { friend = "", opened = false }
+
+local function send_command(cmd)
+    fs.write("coopnet_command.txt", cmd)
+    log("connect: sent command '" .. cmd .. "'")
+end
+
+local function connection_text()
+    local kv = net.kv or {}
+    local last = net.history[#net.history]
+    local fresh = last ~= nil and (os.clock() - last.t) < (NET_TIMEOUT or 2)
+    if kv.mode == "bot" then return "Bot test (no friend connected)" end
+    if kv.mode == "steam" then
+        if kv.peer == nil or kv.peer == "steam:0" then return "Not connected: paste your friend's SteamID below" end
+        if fresh then return "Connected to your friend" end
+        return "Waiting for your friend (they need your SteamID in their Connect panel too)"
+    end
+    return "Mode: " .. tostring(kv.mode)
+end
+
+local function draw_connect_body()
+    local kv = net.kv or {}
+    imgui.text("Status: " .. connection_text())
+    local me = kv.steamSelf
+    if me and me ~= "0" then
+        imgui.text("Your SteamID: " .. me)
+        imgui.same_line()
+        if imgui.button("Copy##myid") then sdk.copy_to_clipboard(me) log("connect: copied own SteamID") end
+    else
+        imgui.text("Your SteamID: (Steam not ready yet)")
+    end
+    local changed, v = imgui.input_text("Friend's SteamID", connect_ui.friend)
+    if changed then connect_ui.friend = v:gsub("%s", "") end
+    local valid = connect_ui.friend:match("^7656119%d%d%d%d%d%d%d%d%d%d$") ~= nil
+    if imgui.button("Connect to friend") then
+        if valid then send_command("steam " .. connect_ui.friend)
+        else log("connect: not a SteamID64 (17 digits starting 7656119)") end
+    end
+    imgui.same_line()
+    if imgui.button("Test with bot") then send_command("bot") end
+    if connect_ui.friend ~= "" and not valid then imgui.text("That doesn't look like a SteamID64 (17 digits starting 7656119).") end
+    if kv.lastCommand and kv.lastCommand ~= "-" then imgui.text("Last change: " .. kv.lastCommand) end
+end
+
+local function draw_connect_panel()
+    if not connect_ui.opened then
+        connect_ui.opened = true
+        if imgui.set_next_item_open then pcall(imgui.set_next_item_open, true) end
+    end
+    if imgui.tree_node("Connect") then
+        local ok, err = pcall(draw_connect_body)   -- tree_pop must run even if the body fails
+        imgui.tree_pop()
+        if not ok and not connect_ui.err then connect_ui.err = true log("connect panel ERR " .. tostring(err)) end
+    end
+end
+
 re.on_draw_ui(function()
     if not imgui.tree_node("coop_dummy (ghost body test)") then return end
+    draw_connect_panel()
     imgui.text("Showing: " .. current)
     if dummy_mesh == nil then
         imgui.text("waiting for the dummy to spawn...")
@@ -1258,6 +1322,22 @@ re.on_draw_ui(function()
         local cchanged, cv = imgui.checkbox(string.format("Collide with the other player (%d pushes)", collide and collide.pushes or 0),
             collide and collide.enabled)
         if cchanged and collide then collide.enabled = cv log("collide.enabled = " .. tostring(cv)) end
+        if imgui.tree_node("Tests") then
+            if imgui.button("Reload last save") then request_reload() end
+            if reload.running then
+                imgui.same_line()
+                if imgui.button("Stop reload test") then reload.running = false log("reload test stopped") end
+                imgui.text(string.format("Reload test: round %d/%d, %s, passed %d, failed %d",
+                    reload.round, reload.total, reload.stage, reload.pass or 0, reload.fail or 0))
+            else
+                imgui.same_line()
+                if imgui.button(string.format("Run reload test (%dx, every %d s)", reload.total, reload.every)) then
+                    start_reload_test()
+                end
+            end
+            imgui.text(string.format("Ghost rebuilds so far: %d%s", ghost_gen, ghost_hidden and " (hidden: no data)" or ""))
+            imgui.tree_pop()
+        end
         -- The ghost builds itself as Ethan; this only redoes it (e.g. after a load).
         if imgui.button("Rebuild Ethan") then
             local ok, err = pcall(build_ethan)
@@ -1315,10 +1395,140 @@ end
 local model = nil
 local phase, frames, t0 = "wait", 0, 0
 
+-- Survive loads, deaths and area changes -------------------------------------------
+-- Those recreate the player object and unload the folder the ghost lives in, so
+-- watch for a new player (or a destroyed ghost) and run the spawn sequence again.
+ghost_gen = 0            -- bumps on every rebuild; the reload test watches it
+
+function respawn_ghost(reason)
+    log("respawn: " .. reason)
+    local destroy = sdk.find_type_definition("via.GameObject"):get_method("destroy(via.GameObject)")
+    for _, p in ipairs(parts) do pcall(destroy.call, destroy, nil, p.go) end
+    if dummy then pcall(destroy.call, destroy, nil, dummy) end
+    parts, dummy, dummy_mesh, candidates = {}, nil, nil, {}
+    anim.motion, anim.ready, anim.clips, anim.playing = nil, false, {}, nil
+    anim.walk, anim.idle, anim.set, anim.poll_until, anim.verify_at = nil, nil, nil, nil, nil
+    anim.last_verify_frame, anim.fail_streak, anim.retries, anim.body_q = nil, 0, 0, nil
+    if look2 then look2.list, look2.jobj = nil, nil end
+    ghost_hidden = false
+    phase, frames = "wait", 0
+    ghost_gen = ghost_gen + 1
+    respawn_t = os.clock()
+end
+
+-- During a load RE7 first shows a temporary loading-scene player with no Ethan
+-- meshes; don't build a ghost for it, wait for the real one.
+local function player_is_ethan(player)
+    local name = tostring(safe(player.call, player, "get_Name") or "")
+    return name:find("^Pl0000") ~= nil
+end
+
+local watch = { addr = nil, t = 0 }
+re.on_frame(function()
+    local now = os.clock()
+    if now - watch.t < 0.5 then return end
+    watch.t = now
+    local player = get_player()
+    local addr = player and safe(player.get_address, player)
+    if addr == nil then return end                         -- loading screen: wait
+    if watch.addr and addr ~= watch.addr then
+        watch.addr = addr
+        respawn_ghost("player object changed (load, death or area change)")
+        return
+    end
+    watch.addr = addr
+    -- Ghost torn down underneath us (its folder unloaded)?
+    if phase == "done" and #parts > 0 then
+        local alive = safe(parts[1].go.call, parts[1].go, "get_Name")
+        if alive == nil then respawn_ghost("ghost objects were destroyed") end
+    end
+end)
+
+-- Reload test -----------------------------------------------------------------------
+-- Loads the save the session started from (what Continue does) and checks the ghost
+-- comes back: rebuilt, a clip bound and advancing, network still flowing. Loading
+-- only reads; coop_saveguard keeps blocking the autosave that follows a load.
+-- Results: reframework/data/coop_reload_test.txt
+-- timeout 180: on this PC a load passes through a temporary loading-scene player for
+-- ~80 s before the real one appears (first run: rebuilds took 7-8 s, 90 s was too tight).
+reload = { running = false, round = 0, total = 10, every = 45, timeout = 180, stage = "idle", lines = {} }
+
+function request_reload()
+    local sdm = sdk.get_managed_singleton("app.SaveDataManager")
+    if sdm == nil then log("reload: no SaveDataManager") return false end
+    local slot = tonumber(safe(sdm.get_field, sdm, "LoadSlotNo") or -1) or -1
+    if slot < 0 then slot = tonumber(safe(sdm.get_field, sdm, "SaveSlotNo") or 0) or 0 end
+    local ok, err = pcall(sdm.call, sdm, "loadFileAutoRequest(System.Int32, System.Boolean, System.Boolean, System.Boolean)",
+        slot, false, false, false)
+    log(string.format("reload: loadFileAutoRequest(slot %d) -> %s", slot, ok and "requested" or ("ERR " .. tostring(err))))
+    return ok
+end
+
+local function reload_note(s)
+    reload.lines[#reload.lines + 1] = os.date("%H:%M:%S ") .. s
+    fs.write("coop_reload_test.txt", table.concat(reload.lines, "\n"))
+    log("reload test: " .. s)
+end
+
+function start_reload_test()
+    reload.running, reload.round, reload.stage, reload.lines = true, 0, "next", {}
+    reload.pass, reload.fail = 0, 0
+    reload_note(string.format("start: %d rounds, one every %d s", reload.total, reload.every))
+end
+
+re.on_frame(function()
+    if not reload.running then return end
+    local now = os.clock()
+    if reload.stage == "next" then
+        if reload.round >= reload.total then
+            reload.running, reload.stage = false, "idle"
+            reload_note(string.format("DONE: %d passed, %d failed", reload.pass, reload.fail))
+            return
+        end
+        reload.round = reload.round + 1
+        reload.gen0, reload.seq0, reload.t = ghost_gen, net.last_in_seq, now
+        if request_reload() then reload.stage = "loading" else reload.stage = "wait"; reload.fail = reload.fail + 1 end
+    elseif reload.stage == "loading" then
+        local rebuilt = ghost_gen > reload.gen0
+        local pieces = #parts >= 5
+        local animating = anim.bound_t ~= nil and anim.bound_t > reload.t
+        local flowing = net.last_in_seq > reload.seq0 and not ghost_hidden
+        if rebuilt and pieces and animating and flowing then
+            reload.pass = reload.pass + 1
+            local appear = (respawn_t and respawn_t > reload.t) and respawn_t or reload.t
+            reload_note(string.format("round %d PASS: load %.1f s, ghost back %.1f s after the player appeared",
+                reload.round, appear - reload.t, now - appear))
+            reload.stage, reload.t = "wait", now
+        elseif now - reload.t > reload.timeout then
+            reload.fail = reload.fail + 1
+            reload_note(string.format("round %d FAIL after %d s: rebuilt=%s pieces=%d animating=%s flowing=%s",
+                reload.round, reload.timeout, tostring(rebuilt), #parts, tostring(animating), tostring(flowing)))
+            reload.stage, reload.t = "wait", now
+        end
+    elseif reload.stage == "wait" and now - reload.t > reload.every then
+        reload.stage = "next"
+    end
+end)
+
+-- Hide the ghost when the other player's data stops (disconnect, alt-tab, crash)
+-- and show him again when it resumes.
+NET_TIMEOUT = 2.0
+ghost_hidden = false
+re.on_frame(function()
+    if not net.enabled or #parts == 0 then return end
+    local last = net.history[#net.history]
+    local stale = (last == nil) or (os.clock() - last.t > NET_TIMEOUT + net.delay)
+    if stale ~= ghost_hidden then
+        ghost_hidden = stale
+        for _, p in ipairs(parts) do pcall(p.go.call, p.go, "set_DrawSelf", not stale) end
+        log(stale and "net: no data for 2 s, ghost hidden" or "net: data resumed, ghost shown")
+    end
+end)
+
 re.on_frame(function()
     frames = frames + 1
     if phase == "wait" then
-        if get_player() and frames > 60 then
+        if get_player() and frames > 60 and player_is_ethan(get_player()) then
             local vr = sdk.get_managed_singleton("app.vr.VrManager")
             prefab = vr and vr:get_field("DummyPlayerPrefab")
             if prefab == nil then log("FAIL: VrManager.DummyPlayerPrefab is nil") phase = "done" return end
@@ -1425,7 +1635,7 @@ end)
 -- update, each joint starts from this frame's animated local pose
 -- (getCalculatedLocalRotation), gets the look turn conjugated into its parent's
 -- space, and is written with Motion.setLocalRotation. No accumulation possible.
-local look2 = { list = nil, fired = 0, reported = false, t0 = os.clock() }
+look2 = { list = nil, fired = 0, reported = false, t0 = os.clock() }   -- global: respawn_ghost (earlier) resets it
 
 local function look2_joints(m)
     local go = m:call("get_GameObject")
