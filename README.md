@@ -1,10 +1,12 @@
-# coop-re7: online co-op for Resident Evil 7 (prototype, v0.5)
+# coop-re7: online co-op for Resident Evil 7 (prototype, v0.6)
 
 Play Resident Evil 7 with a friend over the internet. Each of you sees the other as a full-body **Ethan** who
 walks, jogs, crouches, sidesteps and looks around where they do, over Steam (no port forwarding).
 
-**What's shared today:** where each player is and what they're doing (movement, stance, looking, which chapter).
-**Not shared yet:** enemies, items, doors and story. Each player plays their own copy of the world.
+**What's shared today:** where each player is and what they're doing (movement, stance, looking, which chapter),
+and **enemy damage and deaths**: shoot an enemy and it loses the same health in your friend's game; kill it and
+it dies there too.
+**Not shared yet:** where enemies walk, items, doors and story. Each player plays their own copy of the world.
 
 Made with [coop-anything](https://github.com/cranebeaker/coop-anything). MIT licensed.
 
@@ -61,7 +63,9 @@ first). **Teleport to my friend** works once you're within 40 m of them.
 
 ## Known limits
 
-- Only position, movement, stance, looking and chapter are shared. Enemies, items, doors and story are separate.
+- Enemies: damage and deaths are shared (in the same chapter), but each game still moves its own enemies, so
+  an enemy can be in a different spot on each screen. Your friend's shots don't make it flinch on yours.
+  Bosses and Jack go down on both screens but get back up as usual. Items, doors and story are separate.
 - Tested on one PC against a simulated player; a real two-player session (and the invite / Accept step)
   hasn't been verified yet.
 - coop-re7 is tested on RE7's current (ray-tracing) version. The older non-RT version (Steam beta

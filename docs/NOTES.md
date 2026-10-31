@@ -535,3 +535,54 @@ folder, missing sounds for player 2, RT build only.
 - Research helper `coop_devexec.lua` (test copy only, never in the kit): runs `data/coop_exec.lua` once and
   writes `coop_exec_out.txt`, so probes run without "Reset scripts". All REFramework autorun scripts share
   one Lua state, so globals from coop_dummy are visible to it.
+
+## Enemy sync research (2026-10-31)
+
+- Enemies are in `app.ObjectManager.ManagedObjects` (List<List<GameObject>>, 11 lists in Chapter3); list
+  **1** held the enemies (Em3300, Em3390, Em6100, Em3000, Em3200, Em3100). The `ListType` enum (EnemySave=0,
+  Item=1, ...) does not match these indices; find the list by contents, not by number.
+- Each enemy's folder is scene data, e.g. `Chapter/Chapter3/Enemy_c03/Enemy_c03_1` (Em3000),
+  `.../c03_1_deactivate_DinnerAfter` (Em3100, Em3200). Inactive ones have Draw/Update false.
+- **Stable ID**: regular enemies (Em3000, the Molded) have `app.EnemySave` with `SaveGUID` (System.Guid; read
+  `mData1..3`, `mData4_0..7`; `ToString()` on the ValueType returned garbage). Saved scene data, so the same
+  on both PCs. Story/boss characters (Em3300, Em3100, Em3200, Em6100) have no EnemySave → fall back to
+  folder path + name.
+- **Health**: `app.DamageController` (Em3000: `app.Em3000.Em3000DamageController` → EnemyDamageController →
+  DamageController): `get_health`/`get_maxHealth` (Em3000 10000/10000), `get_isDead`, `setHealth`,
+  `addManualDamage`, `doDie`. `app.EnemyStatus.get_isFinishedDead`, `get_isAppeared`.
+- Plan: (1) deaths: a kill on either side kills the same enemy on the other (idempotent, no authority),
+  remembered for the session so an area loaded later spawns it dead; (2) damage events applied on both sides;
+  (3) host-authoritative enemy movement (the guest's copy driven like the ghost). Same chapter only.
+  One-PC test: the bot sends "friend killed / damaged the nearest enemy".
+- **Correction: Em3000 is Jack Baker** (the stalker: Em3000Grapple, Em3000DoorActionController; Em3001/3002
+  are his later fights). The Molded are Em4000/Em4100/Em4200. Jack also has EnemySave + SaveGUID.
+- Test spawn: an inactive enemy in a loaded folder comes alive with `GameObject.set_UpdateSelf(true)` +
+  `set_DrawSelf(true)`; `app.MovementController.warp` moves it. It attacked at once (owner took 660 damage).
+  No `app.EnemyGenerator` exists in the Chapter3 main-house area.
+- **Kill**: `DamageController.setHealth(0, max)` sets isDead but the enemy keeps walking: not a kill.
+  `DamageController.newFakeDamageInfo(damage, attacker, target)` (static) + `addManualDamage(info)` with
+  damage > health → health 0, death/down animation (motion 0), owner confirmed Jack went down.
+  `isFinishedDead` stayed false (Jack revives in the real game; check whether he gets up).
+- Consequence: stalkers/bosses (Jack) only go down temporarily, so sync "down" as an event and don't
+  remember them as dead; regular Molded die for good and are remembered. Still to test on a Molded.
+- **Step 1 built** (`coop_enemies.lua` + reliable events in CoopNet.cs): "R7E1"+UTF-8 text over
+  `k_nSteamNetworkingSend_Reliable` (8); Lua writes `coopnet_ev_out.txt` (ids from os.time()*1000, so they keep
+  growing across Reset scripts; CoopNet skips what's in the file at its own start), CoopNet writes the last 50
+  received to `coopnet_ev_in.txt` (deleted at start; count from 1). Event: `kill <id> <chapter> <name>`.
+  Bot: `botevent <text>` delivers an event "from the friend" after the simulated latency.
+- Bugs found testing: `fs.read` of a missing file returns "" (not nil), so the "first read = already handled"
+  rule swallowed the first real event; fixed. A kill of health+1000 left Jack on 2300/10000 (damage is scaled,
+  ~0.7): now hp*4+1000, up to 3 hits until `get_isDead`.
+- **Result 2026-10-31**: local kill of Jack detected and sent (`sent: kill g:71041570-... 5 Em3000`); bot's
+  kill of Jack applied, Jack went down (owner confirmed), not echoed back. Not yet tested: a Molded, the
+  "remember for later" path, two real players.
+- **Step 2 (damage)**: scan compares `get_health` every 0.25 s; a drop while alive sends `dmg <id> <chapter>
+  <amount> <name>` (the health actually lost, after the game's scaling). Receiving: `setHealth(hp - amount,
+  max)`, never below 1 (the kill event finishes it properly), and `e.hp` updated so it isn't sent back.
+  No hit-reaction animation on the receiving side yet.
+- Finding a Molded: only `*_Start` jump keys drop into gameplay; `Chapter8` (key without _Start) went to the
+  title. Chapter4_Start loads as Pl2100 with 4 Em4000, 3 Em4100, 2 Em4200 asleep plus Mia (Em2000) awake,
+  but the level didn't load (grey void) from the title; restart fixed it. Molded still untested.
+- **Results 2026-10-31 (fresh launch, Chapter3, all driven via coop_devexec)**: bot kill of the sleeping
+  Jack labelled Em4000 → remembered; waking Jack → killed at once, not echoed. Bot hit 2500 → Jack 10000 →
+  7500 exactly, not echoed. Local hit of 1000 → health 6800, sent `dmg ... 700.0`. Bot kill → down.

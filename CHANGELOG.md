@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.6 (2026-10-31)
+- **Shared enemy damage and deaths** (first step of enemy sync). When you hurt an enemy, it loses the same
+  health in your friend's game; when you kill it (or knock Jack down), it goes down there too. A regular
+  enemy your friend killed in an area you haven't reached yet is already dead when you get there. Only
+  between players in the same chapter.
+- These events use Steam's guaranteed delivery, so a kill can't get lost.
+- On screen: "Enemies: your friend took down ..." for a few seconds.
+- Testing: the bot can hit or take down the enemy nearest to you.
+- Not yet: enemies still move separately in each game, and hits don't make them flinch on the other screen.
+
 ## v0.5 (2026-10-31)
 - **Footsteps**: you hear your friend's footsteps where they walk, using RE7's own walk, jog and crouch
   sounds. Switch off with **Friend's footsteps** in the RE7 Co-op window.

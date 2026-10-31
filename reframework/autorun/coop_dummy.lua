@@ -1630,6 +1630,14 @@ local function draw_testing()
     end
     imgui.text(string.format("Ghost rebuilds: %d   stance %s   direction %s   clip %s", ghost_gen,
         tostring(anim.stance or "-"), tostring(anim.dir or "-"), anim.playing and anim.playing.name or "-"))
+    -- Enemy sync (coop_enemies.lua): the bot takes down the nearest awake enemy.
+    if enemy_sync_status then
+        imgui.text(enemy_sync_status())
+        if imgui.button("Bot: take down the nearest enemy") then enemy_test_msg = enemy_sync_bot_kill_nearest() end
+        imgui.same_line()
+        if imgui.button("Bot: hit it for 25%") then enemy_test_msg = enemy_sync_bot_kill_nearest(0.25) end
+        if enemy_test_msg then imgui.same_line() imgui.text(enemy_test_msg) end
+    end
     local bc, bv = imgui.checkbox("Bot: use a non-English test name", bot_test_name)
     if bc then bot_test_name = bv end
     -- Test "Join my friend" alone: the bot claims a different chapter until reset.
@@ -2352,6 +2360,8 @@ local function hud_lines()
     if os.clock() - hud.bad_t < 10 then
         out[#out + 1] = { "Friend's packets don't match: check you both have the same coop-re7 version", 0xFF6B6BFF }
     end
+    local em = enemy_sync_hud and enemy_sync_hud()
+    if em then out[#out + 1] = { em, 0xFF7FE6FF } end
     out[#out + 1] = { settings.allow_saving and "Saving: on (backed up)" or "Saving: off", 0xFFBFBFBF }
     return out
 end

@@ -177,6 +177,13 @@ public class CoopNet
                 if (s_inFlight[i].due <= now) { deliver(s_inFlight[i].pkt); s_inFlight.RemoveAt(i); }
             }
         }
+
+        // An event "from the friend" (testing), delivered after the usual latency, never lost.
+        public static void QueueEvent(Config c, string text)
+        {
+            double now = s_clock.Elapsed.TotalSeconds;
+            s_inFlight.Add((now + c.simLatencyMs / 1000.0, EncodeEvent(text)));
+        }
     }
 
     // Steam transport (flat API of the game's steam_api64.dll) --------------------
@@ -187,6 +194,7 @@ public class CoopNet
         const string Dll = "steam_api64";
         const int IdentitySize = 136;        // SteamNetworkingIdentity
         const int SendUnreliableNoNagle = 1; // k_nSteamNetworkingSend_UnreliableNoNagle
+        const int SendFlagReliable = 8;      // k_nSteamNetworkingSend_Reliable
         const int SendAutoRestart = 32;      // k_nSteamNetworkingSend_AutoRestartBrokenSession
 
         [DllImport(Dll)] static extern IntPtr SteamAPI_SteamNetworkingMessages_SteamAPI_v002();
@@ -332,6 +340,13 @@ public class CoopNet
                 s_msgs, s_peerIdentity, pkt, (uint)pkt.Length, SendUnreliableNoNagle | SendAutoRestart, s_channel);
         }
 
+        // Events (enemy deaths...) must arrive: Steam retransmits and keeps them in order.
+        public static void SendReliable(byte[] pkt)
+        {
+            LastSendResult = SteamAPI_ISteamNetworkingMessages_SendMessageToUser(
+                s_msgs, s_peerIdentity, pkt, (uint)pkt.Length, SendFlagReliable | SendAutoRestart, s_channel);
+        }
+
         // Non-blocking: drains whatever arrived since the last call.
         public static void Poll(Action<byte[], ulong> onPacket)
         {
@@ -366,7 +381,7 @@ public class CoopNet
         public float LookYaw, LookPitch;   // camera relative to body, radians
     }
 
-    const string Version = "0.5";
+    const string Version = "0.6";
     const int PacketSize = 64;
     static readonly byte[] Magic = { (byte)'R', (byte)'7', (byte)'C', (byte)'2' };
     const int KeepSamples = 32;
@@ -483,6 +498,13 @@ public class CoopNet
             if (s_steamReady) Steam.SetPresence("coop_re7_to", "");
             s_lastCommand = "bot test";
         }
+        else if (parts.Length >= 2 && parts[0] == "botevent")
+        {
+            Bot.QueueEvent(s_cfg, cmd.Substring("botevent ".Length));   // the bot "does" something
+            s_lastCommand = "bot event: " + cmd.Substring("botevent ".Length);
+            WriteStatus("running");
+            return;
+        }
         else if (parts.Length == 1 && parts[0] == "botrecenter")
         {
             Bot.Recenter();   // centre on the next position we send
@@ -514,6 +536,82 @@ public class CoopNet
         SaveConfig();
         API.LogInfo("[CoopNet] command: " + s_lastCommand);
         WriteStatus("running");
+    }
+
+    // Events --------------------------------------------------------------------------
+    // Things that happen once (an enemy died) go reliably, as "R7E1" + UTF-8 text.
+    // Lua -> coopnet_ev_out.txt: "<id>	<text>" lines with ever-growing ids; we send each
+    // new id once. Received events -> coopnet_ev_in.txt: "<n>	<text>" (last 50), and
+    // Lua handles each n once.
+    static readonly byte[] EventMagic = { (byte)'R', (byte)'7', (byte)'E', (byte)'1' };
+    static readonly List<(long n, string text)> s_evIn = new List<(long, string)>();
+    static long s_evInCount, s_evOutLast = -1, s_evSent, s_evRecv;
+    static bool s_evInDirty;
+
+    static byte[] EncodeEvent(string text)
+    {
+        var body = Encoding.UTF8.GetBytes(text);
+        var pkt = new byte[4 + body.Length];
+        Buffer.BlockCopy(EventMagic, 0, pkt, 0, 4);
+        Buffer.BlockCopy(body, 0, pkt, 4, body.Length);
+        return pkt;
+    }
+
+    static bool IsEvent(byte[] d) =>
+        d.Length >= 4 && d[0] == EventMagic[0] && d[1] == EventMagic[1] && d[2] == EventMagic[2] && d[3] == EventMagic[3];
+
+    static void OnEvent(string text)
+    {
+        lock (s_lock)
+        {
+            s_evIn.Add((++s_evInCount, text.Replace('\n', ' ').Replace('\r', ' ')));
+            while (s_evIn.Count > 50) s_evIn.RemoveAt(0);
+            s_evInDirty = true;
+            s_evRecv++;
+        }
+    }
+
+    static void PumpEventsOut(string path)
+    {
+        string[] lines;
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var sr = new StreamReader(fs);
+            lines = sr.ReadToEnd().Split('\n');
+        }
+        catch (FileNotFoundException) { if (s_evOutLast < 0) s_evOutLast = 0; return; }   // nothing sent yet
+        catch (IOException) { return; }
+        catch (UnauthorizedAccessException) { return; }
+        // First look after a (re)start: what's already in the file was sent before.
+        bool first = s_evOutLast < 0;
+        foreach (var line in lines)
+        {
+            var tab = line.IndexOf('\t');
+            if (tab <= 0 || !long.TryParse(line.AsSpan(0, tab), NumberStyles.None, Inv, out var id)) continue;
+            if (first) { s_evOutLast = Math.Max(s_evOutLast, id); continue; }
+            if (id <= s_evOutLast) continue;
+            s_evOutLast = id;
+            var pkt = EncodeEvent(line.Substring(tab + 1).TrimEnd('\r'));
+            if (IsSteam) { if (s_peerSteam != 0) { Steam.SendReliable(pkt); s_evSent++; } }
+            else if (s_sock != null) { s_sock.Send(pkt, pkt.Length, s_peer); s_evSent++; }
+        }
+        if (s_evOutLast < 0) s_evOutLast = 0;
+    }
+
+    static void WriteEventsInIfDirty(string path)
+    {
+        string text;
+        lock (s_lock)
+        {
+            if (!s_evInDirty) return;
+            s_evInDirty = false;
+            var sb = new StringBuilder();
+            foreach (var (n, t) in s_evIn) sb.Append(n.ToString(Inv)).Append('\t').Append(t).Append('\n');
+            text = sb.ToString();
+        }
+        File.WriteAllText(path + ".tmp", text);
+        File.Move(path + ".tmp", path, true);
     }
 
     // Save backups ------------------------------------------------------------------
@@ -562,6 +660,7 @@ public class CoopNet
 
     static void OnPacket(byte[] data, string from)
     {
+        if (IsEvent(data)) { OnEvent(Encoding.UTF8.GetString(data, 4, data.Length - 4)); return; }
         if (!TryDecode(data, out var s)) { Interlocked.Increment(ref s_bad); return; }
         lock (s_lock)
         {
@@ -607,6 +706,9 @@ public class CoopNet
     {
         var outPath = Path.Combine(s_dataDir, "coopnet_out.txt");
         var inPath = Path.Combine(s_dataDir, "coopnet_in.txt");
+        var evOutPath = Path.Combine(s_dataDir, "coopnet_ev_out.txt");
+        var evInPath = Path.Combine(s_dataDir, "coopnet_ev_in.txt");
+        try { File.Delete(evInPath); } catch (IOException) { }   // a new count starts at 1; Lua notices the reset
         var period = TimeSpan.FromMilliseconds(1000.0 / Math.Max(1, s_cfg.sendHz));
         var lastStatus = Stopwatch.StartNew();
         var lastFriends = Stopwatch.StartNew();
@@ -638,7 +740,9 @@ public class CoopNet
                 PollCommand();
                 if (IsSteam) Steam.Poll((data, from) => OnPacket(data, "steam:" + from));
                 if (s_cfg.mode == "bot") { Bot.Tick(s_cfg, pkt => OnPacket(pkt, "bot")); s_sent++; }
+                PumpEventsOut(evOutPath);
                 WriteInFileIfDirty(inPath);
+                WriteEventsInIfDirty(evInPath);
                 if (lastStatus.ElapsedMilliseconds > 1000)
                 {
                     lastStatus.Restart();
@@ -701,7 +805,7 @@ public class CoopNet
             if (s_steamReady)
                 text += $"steamSelf={Steam.SelfId}\nsteamName={Steam.SelfName}\nrelayStatus={Steam.RelayStatus()}\n";
             if (IsSteam) text += $"lastSendResult={Steam.LastSendResult}\npeerName={Steam.PeerName()}\n";
-            text += $"lastCommand={s_lastCommand}\nlastBackup={s_lastBackup}\nbackups={s_backupCount}\nversion={Version}\n";
+            text += $"lastCommand={s_lastCommand}\nlastBackup={s_lastBackup}\nbackups={s_backupCount}\nversion={Version}\nevSent={s_evSent}\nevRecv={s_evRecv}\n";
         }
         WriteStatusSafe(text);
     }
