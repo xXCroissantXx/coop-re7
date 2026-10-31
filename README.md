@@ -1,12 +1,12 @@
-# coop-re7: online co-op for Resident Evil 7 (prototype, v0.6)
+# coop-re7: online co-op for Resident Evil 7 (prototype, v0.7)
 
 Play Resident Evil 7 with a friend over the internet. Each of you sees the other as a full-body **Ethan** who
 walks, jogs, crouches, sidesteps and looks around where they do, over Steam (no port forwarding).
 
 **What's shared today:** where each player is and what they're doing (movement, stance, looking, which chapter),
-and **enemy damage and deaths**: shoot an enemy and it loses the same health in your friend's game; kill it and
-it dies there too.
-**Not shared yet:** where enemies walk, items, doors and story. Each player plays their own copy of the world.
+and **enemies** (early): each enemy is run by the game of the player nearest to it and follows along in the
+other game, and damage and deaths are shared.
+**Not shared yet:** items, doors and story. Each player plays their own copy of the world.
 
 Made with [coop-anything](https://github.com/cranebeaker/coop-anything). MIT licensed.
 
@@ -57,15 +57,17 @@ first). **Teleport to my friend** works once you're within 40 m of them.
 | **Go to my friend's chapter** | Jump to the start of the chapter your friend is in. Saving is switched off first. |
 | **Teleport to my friend** | Hop to them when you're within 40 m (same chapter). Further away, walk: RE7 only loads the area around you. |
 | **Show all online friends** | List every online Steam friend; connecting invites them for when they start RE7 Co-op. |
-| **Test with bot** | A fake player walks around you (walking, jogging, crouching, in every direction), to try everything alone. |
+| **Test with bot** | A fake player to try everything alone. **Follow me**: it walks the path you walked and waits near you. **Walk in a circle**: it cycles every stance and direction. **Stay here**: it stands still. |
+| **Fast-forward this cutscene** / **every cutscene** (Testing) | Runs the game 8x while a cutscene plays (nothing is skipped, it's just quicker). For testing. |
 | **Chapter switcher** (Testing) | Jump straight to any chapter. For testing; saving is switched off first. |
 | **Rebuild Ethan** / **Reload last save** (Testing) | Fix a broken-looking ghost / reload your save (what Continue does). |
 
 ## Known limits
 
-- Enemies: damage and deaths are shared (in the same chapter), but each game still moves its own enemies, so
-  an enemy can be in a different spot on each screen. Your friend's shots don't make it flinch on yours.
-  Bosses and Jack go down on both screens but get back up as usual. Items, doors and story are separate.
+- Enemies (early, same chapter only): each enemy is run by one game (the nearest player's) and copied in the
+  other; it changes hands when the other player gets clearly closer. The copy doesn't show what the enemy is
+  holding, and your friend's shots don't make it flinch on your screen. Bosses and Jack go down on both screens
+  but get back up as usual. Items, doors and story are separate. Handovers between two real games are untested.
 - Tested on one PC against a simulated player; a real two-player session (and the invite / Accept step)
   hasn't been verified yet.
 - coop-re7 is tested on RE7's current (ray-tracing) version. The older non-RT version (Steam beta

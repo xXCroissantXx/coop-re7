@@ -586,3 +586,63 @@ folder, missing sounds for player 2, RT build only.
 - **Results 2026-10-31 (fresh launch, Chapter3, all driven via coop_devexec)**: bot kill of the sleeping
   Jack labelled Em4000 → remembered; waking Jack → killed at once, not echoed. Bot hit 2500 → Jack 10000 →
   7500 exactly, not echoed. Local hit of 1000 → health 6800, sent `dmg ... 700.0`. Bot kill → down.
+
+## Enemy movement research (2026-10-31)
+
+- **Targeting**: `app.EnemyThinkBase` (Em3000Think etc.) has `_Target` (GameObject), `setTarget(GameObject,
+  ReasonType)`, `updateTarget()`, `get_targetStatus()` (ICharacterStatus) and `playerStatus` (IPlayerStatus);
+  Em3000Think adds `setTargetPlayer(GameObject)`. The player carries `app.AI.AIVisionBeacon` (enemies'
+  `app.AI.AIVisionSensor`/`AIHearingSensor` perceive beacons). Pointing an enemy at the other player's ghost
+  needs a target with a status component; not tried yet.
+- **Animation**: enemies have `via.motion.Motion` with 8 layers (TreeLayer), driven by `via.motion.MotionFsm`.
+  Layer state readable: `MotionBankID`, `MotionID`, `Frame`, `Speed`, `EndFrame`. With
+  `MotionFsm.set_Enabled(false)`, `TreeLayer.changeMotion(bank, id, frame, interp, 2, 0)` plays a chosen clip
+  and the frame advances: an enemy can be animated by hand. `MovementController.warp` moves it.
+- AI off: `EnemyOrder.requestThinkOff(Object)` / `requestThinkOn(Object)` exist (not tried).
+- Jack after a death stays down (bank 50 id 0, frame 405) even with `setHealth(10000, 10000)`; he can't be
+  reused for a recording until he gets up by himself or the area reloads.
+- **Step 3 built** (coop_enemies.lua + "R7S1" unreliable snapshots in CoopNet.cs): host (lower SteamID; bot
+  mode = host) writes `coopnet_es_out.txt` 10 Hz: `seq`, `t <time> ch <chapter>`, one line per awake enemy
+  `id x y z yaw bank motion frame speed` (layer 0). Guest: per-id timelines (host clock + smallest offset),
+  puppet = `MotionFsm.set_Enabled(false)` + `EnemyOrder.requestThinkOff(owner string)`, placed 0.15 s behind
+  with `MovementController.warp`, clip via `TreeLayer.changeMotion(bank, id, frame, 8, 2, 0)`, frame corrected
+  with `set_Frame` beyond 4 frames; released (brain back on) 3 s after the enemy leaves the snapshots.
+- Bug: `local _, s = l and parse_line(l)` keeps only the first return value (s = nil): first recording empty.
+- Chapter3 jump fired by script ~15 s after the title appeared loaded Chapter3 with a black screen and no
+  dinner cutscene (loadingState stuck at 0); the owner's own jump after a restart worked.
+- **Record/replay test 2026-10-31 (Jack, fresh launch)**: 6 s recording, 59 samples, clips 20:100 (walk) then
+  20:1600; replay with FSM off retraced 24.65,8.31 → 24.5,12.1, clip switch at 3.5-4.0 s (recorded 3.7 s),
+  frames advancing; released after the end. Not yet seen by eye; enemies still only target their own player.
+- Bot/ghost bugs found 2026-10-31: (1) follow-mode bot replayed our own cutscene bit (recorded during the
+  dinner scene), so the ghost hid for "their cutscene"; the hide test read `anim.flags`, which only updates
+  while the ghost animates, so it never un-hid. Bot now masks Bank to stance bits; hide test reads the newest
+  sample's flags. (2) A hide applied right after a rebuild was undone by the build steps (parts switched back
+  on): a visible, frozen, nameless Ethan with ghost_hidden=true. Draw state is now re-applied every 0.5 s.
+- Jack replayed as a puppet looked "mostly natural" (owner) but held his hands as if carrying something with
+  nothing in them: his held weapon (EquipManager) isn't driven when the FSM/AI are off. To sync later.
+- **Ghost stuck hidden after the peer's clock restarts** (2026-10-31): the receiver's clock offset is the
+  smallest `now - senderTime` seen, never raised. When the sender's clock restarted (CoopNet hot reload here;
+  a friend restarting their game in real play), every new sample mapped minutes into the past → "no data"
+  forever, until Reset scripts. Now the offset restarts when a sample looks 5 s+ older than the offset
+  allows (and on a seq reset); same for enemy snapshots.
+- **Cutscene fast-forward (testing)**: no skip API (cutscenes are `app.GameEventController` + via.timeline;
+  no skip methods). `via.Scene.set_TimeScale(8)` on the current scene while `local_cutscene()` is true, back
+  to 1 when it ends: the Chapter3 dinner scene finished in ~8 s, every scripted step intact. Button
+  "Fast-forward this cutscene" and option "Fast-forward every cutscene" in Testing.
+- **Targeting test 2026-10-31**: `Em3000Think.setTarget(ghost VrDummyPlayer, Specified=4)` was accepted
+  (get_Target = VrDummyPlayer) but cleared within a second (target none): `updateTarget` re-picks from the
+  vision/hearing sensors, and the ghost (no status component, no AIVisionBeacon) isn't a valid target. Jack
+  stood still. Faking a second player (beacon + PlayerStatus on the ghost) risks the game treating it as the
+  player.
+- **Better design: per-enemy ownership.** Each enemy is run (real AI) by the game of the player it's closest
+  to / engaged with, and is a puppet in the other game. The owner hands it over (reliable `own <id>` event)
+  when the other player is clearly closer (hysteresis). Enemies then always target a real local player, and
+  their hits land in the game of the player they attack. No fake targets.
+- **Ownership built** (coop_enemies.lua): `em_move.own[id]` = "me"/"peer". Default: the game where the enemy
+  is awake; both sending → host (lower SteamID) keeps it. Owner hands over (reliable `own <id> <ch> <name>`)
+  when the friend's Ethan is 3 m+ closer (checked every 0.5 s; off in bot mode). Handed enemies are held as
+  puppets until the friend's snapshots arrive; no data for 3 s → taken back. Receiving `own` → release
+  the puppet, run its AI.
+- **One-PC test 2026-10-31 (Jack)**: hand to the bot → FSM off, own=peer; 3 s later taken back (FSM on,
+  own=me). Hand to the bot, then bot's `own` event → released at once, "your friend handed Em3000 to you".
+  Real handovers between two games untested.

@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.7 (2026-10-31)
+- **Enemy movement** (early): each enemy is run by the game of the player nearest to it; the other game turns
+  that enemy's own AI off and has it follow the running game (position and animation, 10 updates a second).
+  When the other player gets clearly closer (3 m), the enemy is handed over, so enemies always chase a real
+  player and their hits land on the right person. If the other game goes quiet, enemies come back after 3 s.
+- **Fixed: your friend could disappear for good after they restarted their game** (their clock restarted and
+  every update looked stale). Same fix for enemy updates.
+- Fixed: your friend's Ethan could get stuck hidden, or visible but frozen without a nameplate, after a
+  cutscene or a rebuild during loading.
+- **Bot**: new "follow me" mode (walks your path, waits near you, copies your stance); "stay here" mode.
+- **Testing**: fast-forward cutscenes (8x); record an enemy and replay it with its AI off; hand an enemy to
+  the bot and back.
+
 ## v0.6 (2026-10-31)
 - **Shared enemy damage and deaths** (first step of enemy sync). When you hurt an enemy, it loses the same
   health in your friend's game; when you kill it (or knock Jack down), it goes down there too. A regular

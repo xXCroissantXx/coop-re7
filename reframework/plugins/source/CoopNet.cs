@@ -60,6 +60,11 @@ public class CoopNet
         public double botStanceEvery { get; set; } = 16.0;
         public double botTurnRateDeg { get; set; } = 240;   // facing changes turn, not snap
         public int botChapter { get; set; } = -1;            // -1: same chapter as us; else fake "other chapter"
+        // "follow": the bot walks the path we walked, a few seconds behind, and waits
+        // near us (stays on real ground). "circle": the old fixed circle with stance and
+        // direction cycling, for checking every walking clip.
+        public string botMode { get; set; } = "follow";
+        public double botFollowDist { get; set; } = 2.5;     // m: stop this close to us
         public int saveBackupsKeep { get; set; } = 20;
         public double botJogSpeed { get; set; } = 3.4;
         public double botCrouchSpeed { get; set; } = 0.9;
@@ -115,6 +120,124 @@ public class CoopNet
             s_haveCenter = true;
         }
 
+        // Follow mode ---------------------------------------------------------------
+        // Our own samples are a trail of real ground with real stance, facing and look,
+        // timed by when we were there (the sample's own game-clock time: the IO thread
+        // picks samples up unevenly, and timing by that made the replay stutter). The bot
+        // replays it from a playhead that runs at normal speed (1.25x when far behind),
+        // stops when the replayed spot gets within botFollowDist of us and only moves on
+        // once it's a metre further (no stop-go flicker at the edge); then it stands and
+        // turns to face us.
+        static readonly List<(double t, Sample s)> s_trail = new List<(double, Sample)>();
+        static double s_head = -1;
+        static float s_fyaw;
+        static bool s_haveFollow, s_waiting;
+
+        public static void Record(Sample local)
+        {
+            double now = local.T;
+            if (s_trail.Count > 0)
+            {
+                var last = s_trail[s_trail.Count - 1].s;
+                double jump = Dist(last, local.Px, local.Py, local.Pz);
+                if (jump > 10 || local.Id != last.Id || local.T < s_trail[s_trail.Count - 1].t)
+                {
+                    // Load, chapter jump or teleport: the old trail leads nowhere now.
+                    s_trail.Clear();
+                    s_head = -1;
+                    s_haveFollow = false;   // hidden again until we walk away from the new spot
+                    API.LogInfo("[CoopNet] bot trail reset (" + (jump > 10 ? "player moved far" : "chapter changed") + ")");
+                }
+            }
+            s_trail.Add((now, local));
+            if (s_head < 0) s_head = now;
+            // Keep at most a minute behind the newest point.
+            if (now - s_head > 60) s_head = now - 60;
+            while (s_trail.Count > 2 && s_trail[1].t < s_head - 1) s_trail.RemoveAt(0);
+        }
+
+        static double Dist(Sample a, float x, float y, float z)
+        {
+            double dx = a.Px - x, dy = a.Py - y, dz = a.Pz - z;
+            return Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        static Sample TrailAt(double t)
+        {
+            for (int i = s_trail.Count - 1; i > 0; i--)
+            {
+                if (s_trail[i - 1].t <= t)
+                {
+                    var (t0, a) = s_trail[i - 1];
+                    var (t1, b) = s_trail[i];
+                    double k = t1 > t0 ? Math.Clamp((t - t0) / (t1 - t0), 0, 1) : 1;
+                    var s = a;
+                    s.Px = (float)(a.Px + (b.Px - a.Px) * k);
+                    s.Py = (float)(a.Py + (b.Py - a.Py) * k);
+                    s.Pz = (float)(a.Pz + (b.Pz - a.Pz) * k);
+                    if (k > 0.5) { s.Qx = b.Qx; s.Qy = b.Qy; s.Qz = b.Qz; s.Qw = b.Qw; s.Bank = b.Bank; s.LookYaw = b.LookYaw; s.LookPitch = b.LookPitch; }
+                    return s;
+                }
+            }
+            return s_trail[0].s;
+        }
+
+        // Returns false while there is nothing to follow yet.
+        static bool FollowStep(Config c, double now, double dt, ref Sample s)
+        {
+            if (s_trail.Count == 0) return false;
+            var me = s_trail[s_trail.Count - 1].s;
+            var at = TrailAt(s_head);
+            double behind = Dist(at, me.Px, me.Py, me.Pz);
+            // A new trail starts where we stand: stay hidden (send nothing) until we've
+            // walked away, so the bot doesn't appear inside us.
+            if (!s_haveFollow && behind < c.botFollowDist) { Expect = "appears once you walk away"; return false; }
+            double rate = behind > 8 ? 1.25 : 1.0;
+            double endT = s_trail[s_trail.Count - 1].t;
+            double nextHead = Math.Min(s_head + dt * rate, endT);
+            var next = TrailAt(nextHead);
+            // Skip the stretches where we stood still: replaying them made the bot stand
+            // around metres away instead of coming over.
+            // Fine steps that stop as soon as the trail moves again: 0.1 s steps with a 2 cm
+            // test caused 52 visible jumps in 75 s (it also fired on slow walking).
+            for (int i = 0; i < 6000 && nextHead < endT && Dist(next, at.Px, at.Py, at.Pz) < 0.003; i++)
+            {
+                nextHead = Math.Min(nextHead + 0.01, endT);
+                next = TrailAt(nextHead);
+            }
+            double gap = Dist(next, me.Px, me.Py, me.Pz);
+            s_waiting = s_waiting ? gap < c.botFollowDist + 1.0 : gap < c.botFollowDist;
+            bool waiting = s_waiting;
+            if (!waiting) { s_head = nextHead; at = next; }
+
+            s.Px = at.Px; s.Py = at.Py; s.Pz = at.Pz;
+            if (waiting)
+            {
+                // Stand and turn to face us; crouch if we were crouching there.
+                double want = Math.Atan2(me.Px - at.Px, me.Pz - at.Pz);
+                if (!s_haveFollow) s_fyaw = (float)want;
+                double diff = Math.IEEERemainder(want - s_fyaw, 2 * Math.PI);
+                double step = c.botTurnRateDeg * Math.PI / 180 * dt;
+                s_fyaw += (float)(Math.Abs(diff) <= step ? diff : Math.Sign(diff) * step);
+                s.Qx = 0; s.Qy = (float)Math.Sin(s_fyaw / 2); s.Qz = 0; s.Qw = (float)Math.Cos(s_fyaw / 2);
+                s.Bank = 4u | (at.Bank & 1u);
+                s.LookYaw = 0; s.LookPitch = 0;
+                Expect = (at.Bank & 1u) != 0 ? "waiting near you, crouched" : "waiting near you";
+            }
+            else
+            {
+                // Replay our facing, stance and look on that stretch.
+                s.Qx = at.Qx; s.Qy = at.Qy; s.Qz = at.Qz; s.Qw = at.Qw;
+                s.Bank = (at.Bank & 3u) | 4u;   // our stance, but never our cutscene bit (it hid the bot)
+                s.LookYaw = at.LookYaw; s.LookPitch = at.LookPitch;
+                s_fyaw = (float)(2 * Math.Atan2(at.Qy, at.Qw));
+                Expect = "following you (" + ((at.Bank & 1u) != 0 ? "crouch" : (at.Bank & 2u) != 0 ? "walk" : "jog") +
+                         (rate > 1 ? ", catching up" : "") + ")";
+            }
+            s_haveFollow = true;
+            return true;
+        }
+
         // Advance the bot, "send" a packet into the simulated network, and deliver
         // whatever has finished its simulated trip.
         public static void Tick(Config c, Action<byte[]> deliver)
@@ -122,6 +245,34 @@ public class CoopNet
             double now = s_clock.Elapsed.TotalSeconds;
             double dt = s_last == 0 ? 0 : now - s_last;
             s_last = now;
+
+            if (c.botMode == "stay" && s_haveFollow)
+            {
+                // Stand where we are (testing: lets us walk away from the bot).
+                var st = new Sample { Seq = ++s_seq, T = now };
+                var at = s_trail.Count > 0 ? TrailAt(s_head) : LastLocal;
+                st.Px = at.Px; st.Py = at.Py; st.Pz = at.Pz;
+                st.Qx = 0; st.Qy = (float)Math.Sin(s_fyaw / 2); st.Qz = 0; st.Qw = (float)Math.Cos(s_fyaw / 2);
+                st.Bank = 4u;
+                st.Id = c.botChapter >= 0 ? (uint)c.botChapter : LastLocal.Id;
+                st.Frame = (float)(LastLocal.T % 1000.0);
+                Expect = "staying here";
+                Transmit(c, now, st);
+                DeliverDue(now, deliver);
+                return;
+            }
+            if (c.botMode == "follow" || c.botMode == "stay")
+            {
+                var f = new Sample { Seq = ++s_seq, T = now };
+                if (FollowStep(c, now, dt, ref f))
+                {
+                    f.Id = c.botChapter >= 0 ? (uint)c.botChapter : LastLocal.Id;
+                    f.Frame = (float)(LastLocal.T % 1000.0);
+                    Transmit(c, now, f);
+                }
+                DeliverDue(now, deliver);
+                return;
+            }
             if (!s_haveCenter) return;
 
             if (s_paused)
@@ -167,11 +318,22 @@ public class CoopNet
             s.LookYaw = (float)(0.9 * Math.Sin(now * 0.7));
             s.LookPitch = (float)(0.35 * Math.Sin(now * 0.45));
 
+            Transmit(c, now, s);
+            DeliverDue(now, deliver);
+        }
+
+        // Into the simulated network: latency, jitter and loss like a real connection.
+        static void Transmit(Config c, double now, Sample s)
+        {
             if (s_rng.NextDouble() * 100 >= c.simLossPct)
             {
                 double delay = (c.simLatencyMs + (s_rng.NextDouble() * 2 - 1) * c.simJitterMs) / 1000.0;
                 s_inFlight.Add((now + Math.Max(0, delay), Encode(s)));
             }
+        }
+
+        static void DeliverDue(double now, Action<byte[]> deliver)
+        {
             for (int i = s_inFlight.Count - 1; i >= 0; i--)
             {
                 if (s_inFlight[i].due <= now) { deliver(s_inFlight[i].pkt); s_inFlight.RemoveAt(i); }
@@ -381,7 +543,7 @@ public class CoopNet
         public float LookYaw, LookPitch;   // camera relative to body, radians
     }
 
-    const string Version = "0.6";
+    const string Version = "0.7";
     const int PacketSize = 64;
     static readonly byte[] Magic = { (byte)'R', (byte)'7', (byte)'C', (byte)'2' };
     const int KeepSamples = 32;
@@ -505,6 +667,15 @@ public class CoopNet
             WriteStatus("running");
             return;
         }
+        else if (parts.Length == 2 && parts[0] == "botmode" && (parts[1] == "follow" || parts[1] == "circle" || parts[1] == "stay"))
+        {
+            s_cfg.botMode = parts[1];
+            Bot.Recenter();   // circle mode starts around where we are now
+            s_lastCommand = "bot mode: " + parts[1];
+            SaveConfig();
+            WriteStatus("running");
+            return;
+        }
         else if (parts.Length == 1 && parts[0] == "botrecenter")
         {
             Bot.Recenter();   // centre on the next position we send
@@ -614,6 +785,53 @@ public class CoopNet
         File.Move(path + ".tmp", path, true);
     }
 
+    // Enemy snapshots ------------------------------------------------------------------
+    // The game that controls the enemies writes coopnet_es_out.txt (first line "seq <n>",
+    // then one line per awake enemy) about 10 times a second. Each new seq goes out
+    // unreliably as "R7S1" + UTF-8 text: only the newest matters, like player movement.
+    // A received snapshot replaces coopnet_es_in.txt.
+    static readonly byte[] SnapMagic = { (byte)'R', (byte)'7', (byte)'S', (byte)'1' };
+    static string s_snapOutSeq = "";
+    static string s_snapIn;
+    static long s_snapSent, s_snapRecv;
+
+    static bool IsSnap(byte[] d) =>
+        d.Length >= 4 && d[0] == SnapMagic[0] && d[1] == SnapMagic[1] && d[2] == SnapMagic[2] && d[3] == SnapMagic[3];
+
+    static void PumpSnapshotOut(string path)
+    {
+        string text;
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var sr = new StreamReader(fs);
+            text = sr.ReadToEnd();
+        }
+        catch (IOException) { return; }
+        catch (UnauthorizedAccessException) { return; }
+        var nl = text.IndexOf('\n');
+        if (nl <= 0 || !text.StartsWith("seq ")) return;
+        var seq = text.Substring(0, nl);
+        if (seq == s_snapOutSeq) return;
+        s_snapOutSeq = seq;
+        var body = Encoding.UTF8.GetBytes(text);
+        if (body.Length > 1100) return;   // stay in one unfragmented message
+        var pkt = new byte[4 + body.Length];
+        Buffer.BlockCopy(SnapMagic, 0, pkt, 0, 4);
+        Buffer.BlockCopy(body, 0, pkt, 4, body.Length);
+        if (IsSteam) { if (s_peerSteam != 0) { Steam.Send(pkt); s_snapSent++; } }
+        else if (s_sock != null) { s_sock.Send(pkt, pkt.Length, s_peer); s_snapSent++; }
+    }
+
+    static void WriteSnapshotInIfNew(string path)
+    {
+        string text;
+        lock (s_lock) { text = s_snapIn; s_snapIn = null; }
+        if (text == null) return;
+        File.WriteAllText(path + ".tmp", text);
+        File.Move(path + ".tmp", path, true);
+    }
+
     // Save backups ------------------------------------------------------------------
     // Copies the game's Steam save folder (userdata\<id>\418370\remote) into
     // reframework/data/save_backups/<stamp>_<reason>/, keeping the newest N. Runs at
@@ -661,6 +879,11 @@ public class CoopNet
     static void OnPacket(byte[] data, string from)
     {
         if (IsEvent(data)) { OnEvent(Encoding.UTF8.GetString(data, 4, data.Length - 4)); return; }
+        if (IsSnap(data))
+        {
+            lock (s_lock) { s_snapIn = Encoding.UTF8.GetString(data, 4, data.Length - 4); s_snapRecv++; }
+            return;
+        }
         if (!TryDecode(data, out var s)) { Interlocked.Increment(ref s_bad); return; }
         lock (s_lock)
         {
@@ -707,6 +930,9 @@ public class CoopNet
         var outPath = Path.Combine(s_dataDir, "coopnet_out.txt");
         var inPath = Path.Combine(s_dataDir, "coopnet_in.txt");
         var evOutPath = Path.Combine(s_dataDir, "coopnet_ev_out.txt");
+        var esOutPath = Path.Combine(s_dataDir, "coopnet_es_out.txt");
+        var esInPath = Path.Combine(s_dataDir, "coopnet_es_in.txt");
+        try { File.Delete(esInPath); } catch (IOException) { }   // no stale enemy positions from a past session
         var evInPath = Path.Combine(s_dataDir, "coopnet_ev_in.txt");
         try { File.Delete(evInPath); } catch (IOException) { }   // a new count starts at 1; Lua notices the reset
         var period = TimeSpan.FromMilliseconds(1000.0 / Math.Max(1, s_cfg.sendHz));
@@ -728,7 +954,8 @@ public class CoopNet
                     }
                     else if (s_cfg.mode == "bot")
                     {
-                        Bot.SetCenter(s);   // the bot circles where we first stood
+                        Bot.SetCenter(s);   // circle mode: the bot circles where we first stood
+                        Bot.Record(s);      // follow mode: our path is the bot's trail
                         Bot.LastLocal = s;
                     }
                     else
@@ -741,6 +968,8 @@ public class CoopNet
                 if (IsSteam) Steam.Poll((data, from) => OnPacket(data, "steam:" + from));
                 if (s_cfg.mode == "bot") { Bot.Tick(s_cfg, pkt => OnPacket(pkt, "bot")); s_sent++; }
                 PumpEventsOut(evOutPath);
+                PumpSnapshotOut(esOutPath);
+                WriteSnapshotInIfNew(esInPath);
                 WriteInFileIfDirty(inPath);
                 WriteEventsInIfDirty(evInPath);
                 if (lastStatus.ElapsedMilliseconds > 1000)
@@ -805,7 +1034,7 @@ public class CoopNet
             if (s_steamReady)
                 text += $"steamSelf={Steam.SelfId}\nsteamName={Steam.SelfName}\nrelayStatus={Steam.RelayStatus()}\n";
             if (IsSteam) text += $"lastSendResult={Steam.LastSendResult}\npeerName={Steam.PeerName()}\n";
-            text += $"lastCommand={s_lastCommand}\nlastBackup={s_lastBackup}\nbackups={s_backupCount}\nversion={Version}\nevSent={s_evSent}\nevRecv={s_evRecv}\n";
+            text += $"lastCommand={s_lastCommand}\nlastBackup={s_lastBackup}\nbackups={s_backupCount}\nversion={Version}\nevSent={s_evSent}\nevRecv={s_evRecv}\nsnapSent={s_snapSent}\nsnapRecv={s_snapRecv}\n";
         }
         WriteStatusSafe(text);
     }

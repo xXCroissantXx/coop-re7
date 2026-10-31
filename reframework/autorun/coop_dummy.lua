@@ -347,6 +347,10 @@ local net = {
     stats = "no status yet",
 }
 
+-- Read-only access for diagnostics (the console helper, testing).
+function coop_net_state() return net end
+function coop_ghost() return dummy end
+
 local function net_io()
     if not net.enabled then return end
     local now = os.clock()
@@ -377,11 +381,14 @@ local function net_io()
             for num in line:gmatch("%S+") do v[#v + 1] = tonumber(num) end
             if #v >= 14 then
                 local seq, t = v[1], v[2]
-                if seq < net.last_in_seq - 1000 then net.last_in_seq = -1 end  -- peer restarted
+                if seq < net.last_in_seq - 1000 then net.last_in_seq = -1 net.offset = nil end  -- peer restarted
                 if seq > net.last_in_seq then
                     net.last_in_seq = seq
                     local off = now - t
-                    if net.offset == nil or off < net.offset then net.offset = off end
+                    -- Smallest offset seen = the least-delayed sample. If samples suddenly
+                    -- look 5 s+ older, the sender's clock restarted (their game or plugin
+                    -- restarted): start over, or every new sample counts as stale forever.
+                    if net.offset == nil or off < net.offset or off > net.offset + 5 then net.offset = off end
                     net.history[#net.history + 1] = { t = t + net.offset,
                         pos = Vector3f.new(v[3], v[4], v[5]), rot = Quaternion.new(v[9], v[6], v[7], v[8]),
                         flags = math.floor(v[10]), look_yaw = v[13], look_pitch = v[14] }
@@ -1619,6 +1626,12 @@ local function draw_testing()
     if imgui.button("Rebuild Ethan") then pcall(build_ethan) end
     imgui.same_line()
     if imgui.button("Teleport to my friend") then teleport_to_friend() end
+    -- Cutscene fast-forward (testing): the whole game runs 8x while a cutscene plays,
+    -- so every scripted step still happens; normal speed returns when it ends.
+    if imgui.button("Fast-forward this cutscene") then fast_forward(true) end
+    imgui.same_line()
+    local fc, fv = imgui.checkbox("Fast-forward every cutscene", settings.ff_cutscenes == true)
+    if fc then settings.ff_cutscenes = fv save_settings() end
     if imgui.button("Reload last save") then request_reload() end
     imgui.same_line()
     if reload.running then
@@ -1637,10 +1650,32 @@ local function draw_testing()
         imgui.same_line()
         if imgui.button("Bot: hit it for 25%") then enemy_test_msg = enemy_sync_bot_kill_nearest(0.25) end
         if enemy_test_msg then imgui.same_line() imgui.text(enemy_test_msg) end
+        if enemy_move_status then
+            imgui.text(enemy_move_status())
+            if imgui.button("Record nearest enemy (6 s)") then enemy_test_msg = enemy_move_record(6) end
+            imgui.same_line()
+            if imgui.button("Replay it with its AI off") then enemy_test_msg = enemy_move_replay() end
+            if enemy_move_test_handoff then
+                if imgui.button("Hand nearest enemy to the bot") then enemy_test_msg = enemy_move_test_handoff() end
+                imgui.same_line()
+                if imgui.button("Bot hands it back") then enemy_test_msg = enemy_move_bot_hands_back() end
+            end
+        end
     end
     local bc, bv = imgui.checkbox("Bot: use a non-English test name", bot_test_name)
     if bc then bot_test_name = bv end
     -- Test "Join my friend" alone: the bot claims a different chapter until reset.
+    -- Bot movement: follow our own path (stays on real ground) or the old test circle.
+    local kvb = net.kv or {}
+    if kvb.mode == "bot" then
+        if imgui.button("Bot: follow me") then send_command("botmode follow") end
+        imgui.same_line()
+        if imgui.button("Bot: walk in a circle") then send_command("botmode circle") end
+        imgui.same_line()
+        if imgui.button("Bot: stay here") then send_command("botmode stay") end
+        imgui.same_line()
+        imgui.text("Bot is: " .. tostring(kvb.botExpect or "-"))
+    end
     if imgui.button("Bot: pretend to be in another chapter") then
         ensure_chapter_list()
         -- The next story chapter after ours (Chapter0 is the prologue tape: skip it),
@@ -2005,6 +2040,27 @@ end)
 
 -- Hide the ghost when the other player's data stops (disconnect, alt-tab, crash)
 -- and show him again when it resumes.
+-- Cutscene fast-forward (testing) ----------------------------------------------------
+FF_SPEED = 8.0
+local ff = { on = false }
+local function scene_obj()
+    return sdk.call_native_func(sdk.get_native_singleton("via.SceneManager"),
+        sdk.find_type_definition("via.SceneManager"), "get_CurrentScene")
+end
+function fast_forward(on)
+    local sc = scene_obj()
+    if sc == nil then return end
+    if on and not local_cutscene() then log("fast-forward: no cutscene playing") return end
+    pcall(sc.call, sc, "set_TimeScale", on and FF_SPEED or 1.0)
+    ff.on = on
+    log("fast-forward: " .. (on and "on" or "off"))
+end
+re.on_frame(function()
+    local playing = local_cutscene()
+    if ff.on and not playing then fast_forward(false)
+    elseif not ff.on and playing and settings and settings.ff_cutscenes then fast_forward(true) end
+end)
+
 NET_TIMEOUT = 2.0
 CUTSCENE_DEBOUNCE = 0.5   -- s an event must run before the ghost hides (no flicker on tiny events)
 ghost_hidden = false
@@ -2028,13 +2084,21 @@ re.on_frame(function()
     local stale = (last == nil) or (now - last.t > NET_TIMEOUT + net.delay)
     -- Hide him while we watch a cutscene, and while *they* are in one (their character
     -- is being moved by their cutscene, which would look odd here).
-    local theirs = anim.flags and (anim.flags & STANCE_CUTSCENE) ~= 0
+    -- From the newest sample, not anim.flags: that is only refreshed while the ghost
+    -- animates, so once hidden for "their cutscene" it never saw the cutscene end.
+    local theirs = last ~= nil and last.flags ~= nil and (last.flags & STANCE_CUTSCENE) ~= 0
     local hide = stale or cutscene_now or theirs
     if hide ~= ghost_hidden then
         ghost_hidden = hide
         for _, p in ipairs(parts) do pcall(p.go.call, p.go, "set_DrawSelf", not hide) end
         local why = stale and "no data for 2 s" or cutscene_now and "you're in a cutscene" or theirs and "they're in a cutscene" or ""
         log(hide and ("ghost hidden: " .. why) or "ghost shown")
+        cs.apply_t = now
+    elseif now - (cs.apply_t or 0) > 0.5 then
+        -- Re-apply twice a second: a hide right after a rebuild was undone by the build
+        -- steps that switch every piece on, leaving a frozen, nameless Ethan on screen.
+        cs.apply_t = now
+        for _, p in ipairs(parts) do pcall(p.go.call, p.go, "set_DrawSelf", not ghost_hidden) end
     end
 end)
 
