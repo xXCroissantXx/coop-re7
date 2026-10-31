@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4 (2026-10-31)
+- **Pick your friend from a list**: the RE7 Co-op window lists your Steam friends who are running RE7 Co-op,
+  each with a **Connect** button. No more copying SteamIDs (still possible under *Connect with a SteamID
+  instead*).
+- **Invites**: connecting to a friend shows them "*<name>* invited you to co-op" on screen; they click
+  **Accept**. Uses Steam rich presence, so nothing else needs setting up.
+- **Go to my friend's chapter**: jumps to the start of your friend's chapter (saving is switched off first).
+  Chapter names are shown instead of numbers.
+- **Teleport to my friend** now lands on ground your friend walked on, and only within 40 m (RE7 only loads
+  the area around you, so long warps could land outside the map).
+- The friend list warns when your friend runs a different coop-re7 version.
+- Fixed: a script error while a chapter was loading. Testing: the bot can pretend to be in another chapter.
+
 ## v0.3 (2026-10-29)
 - **One-click installer** (`Install.cmd`): finds RE7 in Steam, copies it to a co-op folder, downloads
   REFramework + C# add-on from the official release with SHA-256 checks, installs the mod, backs up saves,

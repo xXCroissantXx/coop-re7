@@ -1014,6 +1014,10 @@ function assemble_from(c)
         end
         list = shadow
         log("assemble: " .. tostring(root:call("get_Name")) .. " uses " .. #shadow .. " Shadow* pieces")
+        ghost_built_t = os.clock()
+        -- The bot's circle was centred during the load (often outside the map): move it
+        -- to where the real player now stands.
+        if net.kv and net.kv.mode == "bot" then fs.write("coopnet_command.txt", "botrecenter") end
     end
     local p = get_player():call("get_Transform"):call("get_Position")
     for _, e in ipairs(list) do
@@ -1159,8 +1163,9 @@ re.on_frame(function()
     local aok, aerr = pcall(auto_animate, anchor, anchor_rot)
     if not aok and not anim.auto_err then anim.auto_err = true log("auto ERR " .. tostring(aerr)) end
 
-    if parts_frames % 120 == 0 and anchor then
-        local pp = get_player():call("get_Transform"):call("get_Position")
+    local diag_player = get_player()   -- nil while a chapter loads
+    if parts_frames % 120 == 0 and anchor and diag_player then
+        local pp = diag_player:call("get_Transform"):call("get_Position")
         local dx, dz = anchor.x - pp.x, anchor.z - pp.z
         local plines = {}
         for _, part in ipairs(parts) do
@@ -1280,16 +1285,124 @@ local function connection_text()
     local fresh = last ~= nil and (os.clock() - last.t) < (NET_TIMEOUT or 2)
     if kv.mode == "bot" then return "Bot test (no friend connected)" end
     if kv.mode == "steam" then
-        if kv.peer == nil or kv.peer == "steam:0" then return "Not connected: paste your friend's SteamID below" end
+        if kv.peer == nil or kv.peer == "steam:0" then return "Not connected: pick a friend below" end
         if fresh then return "Connected to your friend" end
-        return "Waiting for your friend (they need your SteamID in their Connect panel too)"
+        return "Waiting for your friend (they need to Accept, or click Connect on you)"
     end
     return "Mode: " .. tostring(kv.mode)
 end
 
-local function draw_connect_body()
+-- Steam friends list (CoopNet writes coopnet_friends.txt every 2 s). Friends running
+-- RE7 Co-op show a Connect button; connecting also shows up on their side as an invite
+-- (Steam rich presence), which they accept with one click.
+friends = { list = {}, t = -100, show_all = false, dismissed = {} }
+
+function read_friends()
+    if os.clock() - friends.t < 2 or fs.read == nil then return end
+    friends.t = os.clock()
+    local text = fs.read("coopnet_friends.txt")
+    if text == nil then return end
+    local list = {}
+    for line in text:gmatch("[^\r\n]+") do
+        local id, flags, ver, name = line:match("^(%d+)\t(%S+)\t(%S+)\t(.*)$")
+        if id then
+            list[#list + 1] = { id = id, name = name, version = ver ~= "-" and ver or nil,
+                in_re7 = flags:find("R") ~= nil, coop = flags:find("C") ~= nil, invites = flags:find("I") ~= nil }
+        end
+    end
+    -- Invites first, then co-op running, then RE7, then everyone else; by name inside each.
+    local function rank(f) return f.invites and 0 or f.coop and 1 or f.in_re7 and 2 or 3 end
+    table.sort(list, function(a, b)
+        if rank(a) ~= rank(b) then return rank(a) < rank(b) end
+        return a.name:lower() < b.name:lower()
+    end)
+    friends.list = list
+end
+
+local function current_peer_id()
     local kv = net.kv or {}
-    imgui.text("Status: " .. connection_text())
+    return kv.mode == "steam" and kv.peer and kv.peer:match("^steam:(%d+)$") or nil
+end
+
+-- A friend who is inviting us and isn't who we're already connected to.
+function pending_invite()
+    local peer = current_peer_id()
+    for _, f in ipairs(friends.list) do
+        if f.invites and f.id ~= peer and not friends.dismissed[f.id] then return f end
+    end
+    return nil
+end
+
+-- The chapter list needs GameManager; retry at most every 5 s while it's empty.
+function ensure_chapter_list()
+    if chapters.list and #chapters.list > 0 then return end
+    if chapters.list_t and os.clock() - chapters.list_t < 5 then return end
+    chapters.list_t = os.clock()
+    chapters.list = list_chapter_jumps()
+end
+
+function chapter_name(v)
+    if v == nil then return "?" end
+    ensure_chapter_list()
+    for _, e in ipairs(chapters.list) do if e.value == v then return e.name end end
+    return tostring(v)
+end
+
+local function connect_to(f)
+    send_command("steam " .. f.id)
+    friends.dismissed[f.id] = nil
+end
+
+local function friend_row(f, i)
+    local peer = current_peer_id()
+    local label = f.name
+    if f.id == peer then
+        label = label .. "  (connected)"
+    elseif f.coop then
+        label = label .. "  (RE7 Co-op " .. tostring(f.version) .. ")"
+    elseif f.in_re7 then
+        label = label .. "  (in RE7, co-op not running)"
+    end
+    if f.coop and f.version and net.kv and net.kv.version and f.version ~= net.kv.version then
+        label = label .. "  - different version, update both to the same"
+    end
+    if f.id ~= peer then
+        if imgui.button((f.invites and "Accept" or "Connect") .. "##fr" .. i) then connect_to(f) end
+        imgui.same_line()
+    end
+    imgui.text(label)
+end
+
+local function draw_friend_list()
+    read_friends()
+    local inv = pending_invite()
+    if inv then
+        local msg = inv.name .. " wants to play co-op with you."
+        if imgui.text_colored then imgui.text_colored(msg, 0xFF7FFF8C) else imgui.text(msg) end
+        if imgui.button("Accept##invite") then connect_to(inv) end
+        imgui.same_line()
+        if imgui.button("Not now##invite") then friends.dismissed[inv.id] = true end
+    end
+    imgui.text("Your Steam friends in RE7 Co-op:")
+    local shown = 0
+    for i, f in ipairs(friends.list) do
+        if f.coop or friends.show_all or f.id == current_peer_id() then
+            friend_row(f, i)
+            shown = shown + 1
+        end
+    end
+    if shown == 0 then
+        imgui.text("  Nobody yet. Your friend needs to start RE7 Co-op too; they'll appear here.")
+    end
+    local c, v = imgui.checkbox("Show all online friends", friends.show_all)
+    if c then friends.show_all = v end
+    if friends.show_all then
+        imgui.text("Connecting to a friend who isn't running RE7 Co-op yet invites them for when they start it.")
+    end
+end
+
+local function draw_steamid_connect()
+    local kv = net.kv or {}
     local me = kv.steamSelf
     if me and me ~= "0" then
         imgui.text("Your SteamID: " .. me)
@@ -1305,9 +1418,57 @@ local function draw_connect_body()
         if valid then send_command("steam " .. connect_ui.friend)
         else log("connect: not a SteamID64 (17 digits starting 7656119)") end
     end
-    imgui.same_line()
-    if imgui.button("Test with bot") then send_command("bot") end
     if connect_ui.friend ~= "" and not valid then imgui.text("That doesn't look like a SteamID64 (17 digits starting 7656119).") end
+end
+
+-- Join friend: jump to the friend's chapter. No automatic teleport afterwards: with
+-- the bot (whose positions aren't real ground) it landed outside the map, and RE7
+-- streams areas in, so warping across a chapter can land somewhere not loaded yet.
+-- "Teleport to my friend" stays a manual button for when you're close.
+join = { msg = "-" }
+
+function join_friend()
+    local last = net.history[#net.history]
+    local fresh = last ~= nil and (os.clock() - last.t) < (NET_TIMEOUT or 2)
+    if not fresh or net.peer_chapter == nil then join.msg = "no friend connected" return end
+    if net.peer_chapter == local_chapter() then join.msg = "you're already in the same chapter" return end
+    chapters.list_t = nil
+    ensure_chapter_list()
+    local target
+    for _, e in ipairs(chapters.list) do if e.value == net.peer_chapter then target = e end end
+    if target == nil then join.msg = "can't jump to the friend's chapter (" .. tostring(net.peer_chapter) .. ")" return end
+    local busy = jump_busy()
+    if busy then join.msg = "not yet: " .. busy return end
+    jump_to_chapter(target)
+    join.msg = "going to " .. target.name .. " (start of the chapter)"
+    log("join: " .. join.msg)
+end
+
+re.on_frame(function()
+    read_friends()   -- also feeds the on-screen invite line
+end)
+
+local function draw_connect_body()
+    local kv = net.kv or {}
+    imgui.text("Status: " .. connection_text())
+    draw_friend_list()
+    local last = net.history[#net.history]
+    if (kv.mode == "steam" or kv.mode == "bot") and last ~= nil and (os.clock() - last.t) < (NET_TIMEOUT or 2) then
+        imgui.text("Friend's chapter: " .. chapter_name(net.peer_chapter) .. "   yours: " .. chapter_name(local_chapter()))
+        if imgui.button("Go to my friend's chapter") then join_friend() end
+        imgui.same_line()
+        imgui.text(join.msg)
+    end
+    if imgui.tree_node("Connect with a SteamID instead") then
+        local ok, err = pcall(draw_steamid_connect)
+        imgui.tree_pop()
+        if not ok then imgui.text("error: " .. tostring(err)) end
+    end
+    if imgui.button("Test with bot") then send_command("bot") end
+    if kv.mode == "bot" then
+        imgui.same_line()
+        imgui.text("(the bot is on: it walks around you)")
+    end
     if kv.lastCommand and kv.lastCommand ~= "-" then imgui.text("Last change: " .. kv.lastCommand) end
 
     if imgui.separator then imgui.separator() end
@@ -1358,6 +1519,10 @@ function list_chapter_jumps()
         end
     end
     log("chapters: " .. #out .. " jump targets")
+    if not chapters.dumped then
+        chapters.dumped = true
+        for _, e in ipairs(out) do log(string.format("  chapter %s = %s -> %s", e.name, tostring(e.value), e.key)) end
+    end
     return out
 end
 
@@ -1367,7 +1532,7 @@ end
 -- and the player has been back in control for a while.
 JUMP_SETTLE = 10   -- s of control after a jump before another is allowed
 
-local function jump_busy()
+function jump_busy()
     local gm = sdk.get_managed_singleton("app.GameManager")
     if gm and safe(gm.get_field, gm, "RequestChapterJump") then return "a chapter jump is still loading" end
     if chapters.jump_t and (respawn_t == nil or respawn_t < chapters.jump_t) and os.clock() - chapters.jump_t < 120 then
@@ -1462,6 +1627,26 @@ local function draw_testing()
     end
     imgui.text(string.format("Ghost rebuilds: %d   stance %s   direction %s   clip %s", ghost_gen,
         tostring(anim.stance or "-"), tostring(anim.dir or "-"), anim.playing and anim.playing.name or "-"))
+    -- Test "Join my friend" alone: the bot claims a different chapter until reset.
+    if imgui.button("Bot: pretend to be in another chapter") then
+        ensure_chapter_list()
+        -- The next story chapter after ours (Chapter0 is the prologue tape: skip it),
+        -- or the one before when we're in the last.
+        local here, pick = local_chapter(), nil
+        for _, e in ipairs(chapters.list or {}) do
+            if e.name:match("^Chapter[1-9]$") and e.value ~= here then
+                if e.value > here and (pick == nil or pick.value < here or e.value < pick.value) then pick = e
+                elseif e.value < here and (pick == nil or (pick.value < here and e.value > pick.value)) then pick = e end
+            end
+        end
+        if pick then
+            send_command("botchapter " .. tostring(pick.value))
+            join.msg = "the bot now claims " .. pick.name
+            log("bot: claims " .. pick.name)
+        end
+    end
+    imgui.same_line()
+    if imgui.button("Bot: back to my chapter") then send_command("botchapter -1") end
     if imgui.tree_node("Chapter switcher") then
         local ok, err = pcall(draw_chapter_switcher)
         imgui.tree_pop()
@@ -1489,16 +1674,37 @@ re.on_draw_ui(function()
 end)
 
 -- Warp next to the other player (when you've got separated). Same chapter only.
+TELEPORT_MAX = 40   -- m
+
 function teleport_to_friend()
-    if dummy == nil or #parts == 0 or ghost_hidden then log("teleport: no friend to go to") return end
-    if net.peer_chapter and net.peer_chapter ~= local_chapter() then log("teleport: friend is in another chapter") return end
+    if dummy == nil or #parts == 0 or ghost_hidden then log("teleport: no friend to go to") return false end
+    if net.peer_chapter and net.peer_chapter ~= local_chapter() then log("teleport: friend is in another chapter") return false end
     local player = get_player()
     local mc = player and player:call("getComponent(System.Type)", sdk.typeof("app.MovementController"))
-    if mc == nil then log("teleport: no MovementController") return end
+    if mc == nil then log("teleport: no MovementController") return false end
+    -- Land where the friend stood about a second ago: ground they actually walked on.
+    -- A fixed sideways offset could be inside a wall; collision pushes us apart after.
     local g = dummy:call("get_Transform"):call("get_Position")
+    local target = Vector3f.new(g.x, g.y, g.z)
+    local now = os.clock()
+    for i = #net.history, 1, -1 do
+        local h = net.history[i]
+        if h.t <= now - net.delay - 1.0 then target = h.pos break end
+    end
+    -- RE7 streams areas in around the player: a long warp can land where nothing is
+    -- loaded yet. Only short hops (same area); otherwise walk towards them.
+    local pp = player:call("get_Transform"):call("get_Position")
+    local dist = math.sqrt((target.x - pp.x) ^ 2 + (target.y - pp.y) ^ 2 + (target.z - pp.z) ^ 2)
+    if dist > TELEPORT_MAX then
+        join.msg = string.format("friend is %d m away: too far to teleport safely, walk closer", math.floor(dist))
+        log("teleport: refused, " .. join.msg)
+        return false
+    end
     local pq = player:call("get_Transform"):call("get_Rotation")
-    local ok, err = pcall(mc.call, mc, "warp(via.vec3, via.Quaternion)", Vector3f.new(g.x + 1.0, g.y, g.z), pq)
+    local ok, err = pcall(mc.call, mc, "warp(via.vec3, via.Quaternion)", target, pq)
+    join.msg = ok and "teleported next to your friend" or "teleport failed"
     log("teleport: " .. (ok and "warped next to friend" or ("ERR " .. tostring(err))))
+    return ok
 end
 
 local function draw_connect_panel()
@@ -2073,18 +2279,23 @@ local function hud_lines()
     if kv.mode == "bot" then
         out[#out + 1] = { "Co-op: bot test" .. ping, 0xFFFFD27F }
     elseif kv.mode == "steam" and (kv.peer == nil or kv.peer == "steam:0") then
-        out[#out + 1] = { "Co-op: not connected (Insert > coop_dummy > Connect)", 0xFF9EB7FF }
+        out[#out + 1] = { "Co-op: not connected (press Insert, RE7 Co-op window)", 0xFF9EB7FF }
     elseif fresh then
         local who = (kv.peerName and kv.peerName ~= "") and kv.peerName or "your friend"
         out[#out + 1] = { "Co-op: connected to " .. who .. ping, 0xFF7FFF8C }
     else
         out[#out + 1] = { "Co-op: waiting for your friend...", 0xFF7FE6FF }
     end
+    local inv = pending_invite and pending_invite()
+    if inv then
+        out[#out + 1] = { inv.name .. " invited you to co-op: press Insert, then Accept in the RE7 Co-op window", 0xFF7FFF8C }
+    end
     if fresh and anim.flags and (anim.flags & STANCE_CUTSCENE) ~= 0 then
         out[#out + 1] = { "Friend is watching a cutscene", 0xFF7FE6FF }
     end
     if fresh and net.peer_chapter and net.peer_chapter ~= local_chapter() then
-        out[#out + 1] = { string.format("Friend is in another chapter (%d, you're in %d)", net.peer_chapter, local_chapter()), 0xFF7FE6FF }
+        out[#out + 1] = { string.format("Friend is in %s (you're in %s): Go to my friend's chapter in the RE7 Co-op window",
+            chapter_name(net.peer_chapter), chapter_name(local_chapter())), 0xFF7FE6FF }
     end
     -- Packets we can't decode usually mean the other player runs another mod version.
     local bad = tonumber(kv.bad or 0) or 0

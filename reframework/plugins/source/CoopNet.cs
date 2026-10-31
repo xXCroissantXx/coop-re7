@@ -99,6 +99,8 @@ public class CoopNet
         // from the circle (load, chapter jump, teleport); otherwise it kept circling the
         // old chapter's coordinates, outside the new map.
         static uint s_centerChapter;
+        public static void Recenter() => s_haveCenter = false;
+
         public static void SetCenter(Sample local)
         {
             if (s_haveCenter)
@@ -210,8 +212,20 @@ public class CoopNet
         [DllImport(Dll)] [return: MarshalAs(UnmanagedType.I1)]
         static extern bool SteamAPI_ISteamNetworkingMessages_AcceptSessionWithUser(IntPtr self, IntPtr identity);
         [DllImport(Dll)] static extern void SteamAPI_SteamNetworkingMessage_t_Release(IntPtr msg);
+        [DllImport(Dll)] static extern int SteamAPI_ISteamFriends_GetFriendCount(IntPtr self, int flags);
+        [DllImport(Dll)] static extern ulong SteamAPI_ISteamFriends_GetFriendByIndex(IntPtr self, int index, int flags);
+        [DllImport(Dll)] static extern int SteamAPI_ISteamFriends_GetFriendPersonaState(IntPtr self, ulong steamId);
+        [DllImport(Dll)] [return: MarshalAs(UnmanagedType.I1)]
+        static extern bool SteamAPI_ISteamFriends_GetFriendGamePlayed(IntPtr self, ulong steamId, IntPtr info);
+        [DllImport(Dll)] [return: MarshalAs(UnmanagedType.I1)]
+        static extern bool SteamAPI_ISteamFriends_SetRichPresence(IntPtr self, byte[] key, byte[] value);
+        [DllImport(Dll)] static extern IntPtr SteamAPI_ISteamFriends_GetFriendRichPresence(IntPtr self, ulong steamId, byte[] key);
+        [DllImport(Dll)] static extern void SteamAPI_ISteamFriends_RequestFriendRichPresence(IntPtr self, ulong steamId);
 
-        static IntPtr s_msgs, s_utils, s_peerIdentity, s_friends, s_user;
+        const int FriendFlagImmediate = 4;   // k_EFriendFlagImmediate: regular friends
+        const uint Re7AppId = 418370;
+
+        static IntPtr s_msgs, s_utils, s_peerIdentity, s_friends, s_user, s_gameInfo;
         static ulong s_peerId;
         static int s_channel;
         static readonly IntPtr[] s_inbox = new IntPtr[32];
@@ -243,6 +257,49 @@ public class CoopNet
             if (s_friends == IntPtr.Zero || s_peerId == 0) return "";
             var name = Marshal.PtrToStringUTF8(SteamAPI_ISteamFriends_GetFriendPersonaName(s_friends, s_peerId)) ?? "";
             return name == "[unknown]" ? "" : name;
+        }
+
+        static byte[] Utf8z(string s) => Encoding.UTF8.GetBytes((s ?? "") + "\0");
+
+        // Rich presence is shared automatically with friends in the same game, which
+        // makes it a callback-free way to say "co-op is running" and "I'm inviting you".
+        public static void SetPresence(string key, string value)
+        {
+            if (s_friends != IntPtr.Zero) SteamAPI_ISteamFriends_SetRichPresence(s_friends, Utf8z(key), Utf8z(value));
+        }
+
+        static string Presence(ulong id, string key) =>
+            Marshal.PtrToStringUTF8(SteamAPI_ISteamFriends_GetFriendRichPresence(s_friends, id, Utf8z(key))) ?? "";
+
+        public struct Friend { public ulong Id; public string Name, CoopVersion; public bool InRe7, InvitesMe; }
+
+        static readonly HashSet<ulong> s_presenceAsked = new HashSet<ulong>();
+
+        // Online friends, with whether they're in RE7, running co-op, or inviting us.
+        public static List<Friend> Friends()
+        {
+            var list = new List<Friend>();
+            if (s_friends == IntPtr.Zero) return list;
+            if (s_gameInfo == IntPtr.Zero) s_gameInfo = Marshal.AllocHGlobal(64);   // FriendGameInfo_t (24 bytes)
+            int n = SteamAPI_ISteamFriends_GetFriendCount(s_friends, FriendFlagImmediate);
+            for (int i = 0; i < n; i++)
+            {
+                var id = SteamAPI_ISteamFriends_GetFriendByIndex(s_friends, i, FriendFlagImmediate);
+                if (id == 0 || SteamAPI_ISteamFriends_GetFriendPersonaState(s_friends, id) == 0) continue;   // offline
+                // FriendGameInfo_t starts with the CGameID; its low 24 bits are the app id.
+                bool inRe7 = SteamAPI_ISteamFriends_GetFriendGamePlayed(s_friends, id, s_gameInfo) &&
+                             ((ulong)Marshal.ReadInt64(s_gameInfo) & 0xFFFFFF) == Re7AppId;
+                var f = new Friend { Id = id, InRe7 = inRe7, CoopVersion = "", Name =
+                    Marshal.PtrToStringUTF8(SteamAPI_ISteamFriends_GetFriendPersonaName(s_friends, id)) ?? "?" };
+                if (inRe7)
+                {
+                    if (s_presenceAsked.Add(id)) SteamAPI_ISteamFriends_RequestFriendRichPresence(s_friends, id);
+                    f.CoopVersion = Presence(id, "coop_re7");
+                    f.InvitesMe = Presence(id, "coop_re7_to") == SelfId.ToString(Inv);
+                }
+                list.Add(f);
+            }
+            return list;
         }
 
         // ...\Steam\userdata\<id>\418370\local; the game's saves sit in the sibling "remote".
@@ -309,7 +366,7 @@ public class CoopNet
         public float LookYaw, LookPitch;   // camera relative to body, radians
     }
 
-    const string Version = "0.3";
+    const string Version = "0.4";
     const int PacketSize = 64;
     static readonly byte[] Magic = { (byte)'R', (byte)'7', (byte)'C', (byte)'2' };
     const int KeepSamples = 32;
@@ -344,6 +401,7 @@ public class CoopNet
             try { Steam.Init(s_cfg.steamChannel); s_steamReady = true; }
             catch (Exception e) { API.LogWarning("[CoopNet] Steam unavailable: " + e.Message); }
             if (s_steamReady) BackupSaves("launch");   // a fresh copy every time the mod starts
+            if (s_steamReady) Steam.SetPresence("coop_re7", Version);   // friends' Connect lists show us
 
             if (IsSteam)
             {
@@ -352,6 +410,7 @@ public class CoopNet
                 s_peerSteam = want == "self" ? Steam.SelfId          // loopback experiment
                     : ulong.TryParse(want, NumberStyles.None, Inv, out var id) ? id : 0;  // 0: just show our own id
                 Steam.SetPeer(s_peerSteam);
+                if (s_peerSteam != Steam.SelfId) Steam.SetPresence("coop_re7_to", s_peerSteam == 0 ? "" : s_peerSteam.ToString(Inv));
                 API.LogInfo($"[CoopNet] steam self={Steam.SelfId} ({Steam.SelfName}) peer={s_peerSteam}");
             }
             else if (s_cfg.mode == "bot")
@@ -388,6 +447,7 @@ public class CoopNet
         try { s_sock?.Close(); } catch { }
         s_recvThread?.Join(1000);
         s_ioThread?.Join(1000);
+        if (s_steamReady) { Steam.SetPresence("coop_re7", ""); Steam.SetPresence("coop_re7_to", ""); }
         if (IsSteam) Steam.Shutdown();
         API.LogInfo("[CoopNet] stopped");
     }
@@ -413,12 +473,29 @@ public class CoopNet
             s_cfg.peerSteamId = parts[1];
             s_peerSteam = id;
             Steam.SetPeer(id);
+            Steam.SetPresence("coop_re7_to", parts[1]);   // shows as an invite on the friend's side
             s_lastCommand = "connected to " + parts[1];
         }
         else if (parts.Length == 1 && parts[0] == "bot")
         {
             s_cfg.mode = "bot";
+            s_cfg.botChapter = -1;   // a fresh bot stands in our chapter (it was saved with the config)
+            if (s_steamReady) Steam.SetPresence("coop_re7_to", "");
             s_lastCommand = "bot test";
+        }
+        else if (parts.Length == 1 && parts[0] == "botrecenter")
+        {
+            Bot.Recenter();   // centre on the next position we send
+            s_lastCommand = "bot re-centred";
+            WriteStatus("running");
+            return;
+        }
+        else if (parts.Length == 2 && parts[0] == "botchapter" && int.TryParse(parts[1], NumberStyles.AllowLeadingSign, Inv, out var ch))
+        {
+            s_cfg.botChapter = ch;   // test "Join my friend": the bot claims another chapter
+            s_lastCommand = "bot chapter " + ch;
+            WriteStatus("running");
+            return;   // not saved: the next launch starts with the bot beside us again
         }
         else if (parts.Length == 2 && parts[0] == "backup")
         {
@@ -532,6 +609,7 @@ public class CoopNet
         var inPath = Path.Combine(s_dataDir, "coopnet_in.txt");
         var period = TimeSpan.FromMilliseconds(1000.0 / Math.Max(1, s_cfg.sendHz));
         var lastStatus = Stopwatch.StartNew();
+        var lastFriends = Stopwatch.StartNew();
 
         while (s_running)
         {
@@ -565,6 +643,11 @@ public class CoopNet
                 {
                     lastStatus.Restart();
                     WriteStatus("running");
+                }
+                if (s_steamReady && lastFriends.ElapsedMilliseconds > 2000)
+                {
+                    lastFriends.Restart();
+                    WriteFriends();
                 }
             }
             catch (ObjectDisposedException) { return; }
@@ -621,6 +704,23 @@ public class CoopNet
             text += $"lastCommand={s_lastCommand}\nlastBackup={s_lastBackup}\nbackups={s_backupCount}\nversion={Version}\n";
         }
         WriteStatusSafe(text);
+    }
+
+    // coopnet_friends.txt for the Connect list: id<TAB>flags<TAB>coop version<TAB>name,
+    // flags R = in RE7, C = co-op running, I = inviting us. Online friends only.
+    static void WriteFriends()
+    {
+        var sb = new StringBuilder();
+        foreach (var f in Steam.Friends())
+        {
+            var flags = (f.InRe7 ? "R" : "") + (f.CoopVersion != "" ? "C" : "") + (f.InvitesMe ? "I" : "");
+            var name = f.Name.Replace('\t', ' ').Replace('\r', ' ').Replace('\n', ' ');
+            sb.Append(f.Id.ToString(Inv)).Append('\t').Append(flags == "" ? "-" : flags).Append('\t')
+              .Append(f.CoopVersion == "" ? "-" : f.CoopVersion).Append('\t').Append(name).Append('\n');
+        }
+        var path = Path.Combine(s_dataDir, "coopnet_friends.txt");
+        File.WriteAllText(path + ".tmp", sb.ToString());
+        File.Move(path + ".tmp", path, true);
     }
 
     static void WriteStatusSafe(string text)

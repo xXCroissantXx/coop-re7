@@ -488,3 +488,33 @@ Spawn through `via.Prefab` (`sdk.create_resource("via.Prefab", path)` → holder
 
 ## Open questions
 - Does the friend own RE7 on Steam (same build)?
+
+## v0.4: easy joining (2026-10-31)
+
+Prompted by the RE2 (2019) multiplayer mod on Nexus (mod 3118, Kenjiro, 2026-10-30): lobby from the game's
+menu, connect by Steam invite / IP / LAN, native `REENGINECOOP.dll` + large Lua, exported mesh/rig/face data,
+character choice. Code is not public and asset/modification use needs the author's permission, so only ideas
+were taken. Its users' main problems: wrong REFramework version (hang on "loading"), files in the wrong
+folder, missing sounds for player 2, RT build only.
+
+- **Friend list**: `ISteamFriends` flat API (`GetFriendCount`/`GetFriendByIndex` with k_EFriendFlagImmediate=4,
+  `GetFriendPersonaState`, `GetFriendGamePlayed` → FriendGameInfo_t whose first 8 bytes are the CGameID; low
+  24 bits = app id 418370). Written every 2 s to `coopnet_friends.txt` (id, flags R/C/I, version, name).
+- **Invites without callbacks**: Steam rich presence (shared automatically between friends in the same game).
+  `coop_re7` = mod version (we're running co-op), `coop_re7_to` = SteamID we connected to. The other side sees
+  `coop_re7_to == self` → invite line on the HUD and an Accept button (= connect back). Cleared on unload.
+  Not yet verified with two accounts.
+- **Go to my friend's chapter**: `_CurrentChapter` values = `ChapterNo` enum values; jump targets logged:
+  Chapter0=2, Title=3, Chapter1=4, Chapter3=5, Chapter4=6, FF000=7, FF030=10, FF040=11, FF050=12,
+  Chapter123=13, Chapter324=14, Chapter7_1..4=29..32, Chapter8=35, Chapter9=37 (33 targets in all).
+- **Auto-teleport after a jump was dropped.** Tries: teleport fired during load (ghost not built yet) and
+  reported success anyway; then onto the bot whose circle had been centred on the loading-scene position →
+  outside the map; then right after a cutscene → the game loaded another chapter. RE7 streams areas in, so a
+  long warp can land in unloaded space even with a real friend. Teleport is now manual, onto the friend's
+  position ~1 s ago (walked ground), refused beyond 40 m.
+- Bot: `botrecenter` command sent when the ghost is rebuilt after a load; `botchapter <n>` (not saved;
+  "Test with bot" resets it; it had been persisted by SaveConfig once and kept the bot in Chapter0).
+- ~10 debug chapter jumps in one session again broke the game (black screen in Chapter3). A fresh launch
+  fixed it; the single-jump test then **passed** (2026-10-31, bot claims another chapter → Go to my friend's
+  chapter → arrived at its start, playable).
+- Fixed: periodic diag in the ghost update indexed `get_player()` while it was nil during a load.

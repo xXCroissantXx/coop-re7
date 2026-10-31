@@ -1,4 +1,4 @@
-# coop-re7: online co-op for Resident Evil 7 (prototype, v0.3)
+# coop-re7: online co-op for Resident Evil 7 (prototype, v0.4)
 
 Play Resident Evil 7 with a friend over the internet. Each of you sees the other as a full-body **Ethan** who
 walks, jogs, crouches, sidesteps and looks around where they do, over Steam (no port forwarding).
@@ -29,16 +29,19 @@ when it finds one, keeps your friend's SteamID, and replaces only the mod files.
    outside the guest house); be roughly in the same spot.
 2. Press **Insert**. A **RE7 Co-op** window opens next to the REFramework menu. Expand
    **Connect, saving and display**.
-3. Click **Copy** next to *Your SteamID* and send it to your friend. Paste **theirs** into *Friend's SteamID*
-   and click **Connect to friend**. Both of you do this.
-4. The top-left corner shows **Co-op: connected to <name> - <ping> ms** once their data arrives, and they appear
-   as Ethan with their name over their head.
+3. Under *Your Steam friends in RE7 Co-op*, click **Connect** next to your friend's name. (They appear there
+   once they've started RE7 Co-op too.)
+4. Your friend sees "*<your name>* invited you to co-op" at the top left of their screen. They press Insert and
+   click **Accept**.
+5. The top-left corner shows **Co-op: connected to <name> - <ping> ms**, and they appear as Ethan with their
+   name over their head.
 
-Your friend's ID is saved, so next time it reconnects by itself.
+Your friend is remembered, so next time it reconnects by itself. Connecting by SteamID still works, under
+**Connect with a SteamID instead**.
 
-**Tip: start together.** Both open **Testing → Chapter switcher** in the RE7 Co-op window and jump to the
-same chapter (for example **Chapter3**). You both start at exactly the same spot, and it loads much faster
-than Continue. Nothing from a jump is saved (the switcher turns saving off first).
+**Meeting up.** If your friend is in another chapter, click **Go to my friend's chapter**: you start at the
+beginning of their chapter, then walk to each other. Nothing from the jump is saved (saving is switched off
+first). **Teleport to my friend** works once you're within 40 m of them.
 
 ### Options (RE7 Co-op window)
 
@@ -48,7 +51,9 @@ than Continue. Nothing from a jump is saved (the switcher turns saving off first
 | **Back up saves now** | An extra backup on demand. |
 | **On-screen status** | The top-left status lines (connection, ping, chapter, saving). |
 | **Nameplate over your friend** | Their Steam name above their Ethan. |
-| **Teleport to my friend** | Jump next to them if you got separated (same chapter only). |
+| **Go to my friend's chapter** | Jump to the start of the chapter your friend is in. Saving is switched off first. |
+| **Teleport to my friend** | Hop to them when you're within 40 m (same chapter). Further away, walk: RE7 only loads the area around you. |
+| **Show all online friends** | List every online Steam friend; connecting invites them for when they start RE7 Co-op. |
 | **Test with bot** | A fake player walks around you (walking, jogging, crouching, in every direction), to try everything alone. |
 | **Chapter switcher** (Testing) | Jump straight to any chapter. For testing; saving is switched off first. |
 | **Rebuild Ethan** / **Reload last save** (Testing) | Fix a broken-looking ghost / reload your save (what Continue does). |
@@ -56,16 +61,19 @@ than Continue. Nothing from a jump is saved (the switcher turns saving off first
 ## Known limits
 
 - Only position, movement, stance, looking and chapter are shared. Enemies, items, doors and story are separate.
-- You only see your friend while both of you are playing as Ethan (not in Mia's or other characters' sections).
-- Tested on one PC against a simulated player; a real two-player session hasn't been verified yet.
+- Tested on one PC against a simulated player; a real two-player session (and the invite / Accept step)
+  hasn't been verified yet.
+- The chapter jump is a hidden developer feature of RE7: after many jumps in one session it can break (black
+  screen, outside the map). Restart the game if that happens.
 
 ## Troubleshooting
 
 | What you see | Try |
 |---|---|
-| "Waiting for your friend" on both sides | Each of you must paste the *other* person's SteamID and click Connect |
+| Your friend isn't in the list | They need RE7 Co-op running and to be your Steam friend; or tick **Show all online friends** |
+| "Waiting for your friend" | They need to click **Accept** (or **Connect** on you) |
 | "Friend's packets don't match" | You're on different coop-re7 versions; both install the same release |
-| "Friend is in another chapter" | Load into the same chapter |
+| "Friend is in another chapter" | Click **Go to my friend's chapter** |
 | Their label moves but no body | Wait a few seconds, or press **Rebuild Ethan** in the coop_dummy menu |
 
 Logs for bug reports: `reframework\data\coopnet_status.txt` and `reframework\data\coop_dummy_log.txt` in
