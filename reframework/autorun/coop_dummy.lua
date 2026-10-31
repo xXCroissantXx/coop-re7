@@ -1260,7 +1260,7 @@ local function set_motion_enabled(on)
 end
 
 -- Settings shared with coop_saveguard.lua (reframework/data/coop_settings.json).
-settings = { allow_saving = false, hud = true, nameplate = true }
+settings = { allow_saving = false, hud = true, nameplate = true, footsteps = true }
 do
     local ok, s = pcall(json.load_file, "coop_settings.json")
     if ok and type(s) == "table" then for k, v in pairs(s) do settings[k] = v end end
@@ -1495,6 +1495,9 @@ local function draw_connect_body()
     imgui.same_line()
     local nchanged, nv = imgui.checkbox("Nameplate over your friend", settings.nameplate)
     if nchanged then settings.nameplate = nv save_settings() end
+    imgui.same_line()
+    local fchanged, fv = imgui.checkbox("Friend's footsteps", settings.footsteps ~= false)
+    if fchanged then settings.footsteps = fv save_settings() end
     if imgui.button("Teleport to my friend") then teleport_to_friend() end
 end
 
@@ -1627,6 +1630,8 @@ local function draw_testing()
     end
     imgui.text(string.format("Ghost rebuilds: %d   stance %s   direction %s   clip %s", ghost_gen,
         tostring(anim.stance or "-"), tostring(anim.dir or "-"), anim.playing and anim.playing.name or "-"))
+    local bc, bv = imgui.checkbox("Bot: use a non-English test name", bot_test_name)
+    if bc then bot_test_name = bv end
     -- Test "Join my friend" alone: the bot claims a different chapter until reset.
     if imgui.button("Bot: pretend to be in another chapter") then
         ensure_chapter_list()
@@ -1675,6 +1680,8 @@ end)
 
 -- Warp next to the other player (when you've got separated). Same chapter only.
 TELEPORT_MAX = 40   -- m
+bot_test_name = false
+BOT_TEST_NAME = "Тест 测试 テスト 테스트 Ünï"
 
 function teleport_to_friend()
     if dummy == nil or #parts == 0 or ghost_hidden then log("teleport: no friend to go to") return false end
@@ -2122,7 +2129,8 @@ re.on_frame(function()
             -- Nameplate over the other player's head (their Steam name; "Bot" in bot mode).
             if not ghost_hidden and #parts > 0 and settings and settings.nameplate ~= false then
                 local kv = net.kv or {}
-                local name = (kv.mode == "bot") and "Bot" or ((kv.peerName and kv.peerName ~= "") and kv.peerName or "Friend")
+                local name = (kv.mode == "bot") and (bot_test_name and BOT_TEST_NAME or "Bot")
+                    or ((kv.peerName and kv.peerName ~= "") and kv.peerName or "Friend")
                 pcall(draw.world_text, name, Vector3f.new(p.x, p.y + 2.0, p.z), 0xFFFFFFFF)
             end
             if frames % 120 == 0 then
@@ -2262,6 +2270,46 @@ re.on_frame(function()
         log("look v2: UpdateMotion hook fired " .. look2.fired .. " times in 3 s" ..
             (look2.fired == 0 and " (hook name not valid in RE7?)" or ""))
     end
+end)
+
+-- Footsteps ----------------------------------------------------------------------
+-- The ghost has no sound components. The local player's app.FootEffectController has
+-- callSE(SETriggerTypeEnum, position, materialID), which plays Ethan's footstep at any
+-- position; SETarget picks the walk/jog/crouch sound set. One step per stride travelled.
+-- The ground material is ours (the friend's isn't sent), close enough nearby.
+STEP_STRIDE = { walk = 0.75, jog = 1.05, crouch = 0.6 }
+STEP_TARGET = { walk = 0, jog = 1, crouch = 2 }   -- SETriggerTargetEnum Player/PlayerJog/PlayerCrouch
+local steps = { last = nil, dist = 0, left = true, err = false }
+
+re.on_frame(function()
+    if not (settings and settings.footsteps ~= false) or dummy == nil or ghost_hidden or #parts == 0 then
+        steps.last = nil
+        return
+    end
+    local ok, err = pcall(function()
+        local p = dummy:call("get_Transform"):call("get_Position")
+        local last = steps.last
+        steps.last = Vector3f.new(p.x, p.y, p.z)
+        if last == nil then return end
+        local d = math.sqrt((p.x - last.x) ^ 2 + (p.z - last.z) ^ 2)
+        if d > 2 then steps.dist = 0 return end   -- a rebuild or teleport, not walking
+        local stance = anim.stance
+        local stride = STEP_STRIDE[stance]
+        if stride == nil then steps.dist = 0 return end
+        steps.dist = steps.dist + d
+        if steps.dist < stride then return end
+        steps.dist = steps.dist - stride
+        local player = get_player()
+        local fe = player and player:call("getComponent(System.Type)", sdk.typeof("app.FootEffectController"))
+        if fe == nil then return end
+        local before = fe:get_field("SETarget")
+        fe:set_field("SETarget", STEP_TARGET[stance])
+        fe:call("callSE(app.FootEffectController.SETriggerTypeEnum, via.vec3, System.UInt32)",
+            steps.left and 0 or 1, steps.last, fe:get_field("MaterialID"))
+        fe:set_field("SETarget", before)
+        steps.left = not steps.left
+    end)
+    if not ok and not steps.err then steps.err = true log("footsteps ERR " .. tostring(err)) end
 end)
 
 -- On-screen status ------------------------------------------------------------------

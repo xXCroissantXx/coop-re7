@@ -63,9 +63,9 @@ function Find-RE7 {
     }
     foreach ($lib in ($libs | Select-Object -Unique)) {
         $p = Join-Path $lib "steamapps\common\RESIDENT EVIL 7 biohazard"
-        if (Test-Path (Join-Path $p "re7.exe")) { return @{ Game = $p; Steam = $steam } }
+        if (Test-Path (Join-Path $p "re7.exe")) { return @{ Game = $p; Steam = $steam; Lib = $lib } }
     }
-    return @{ Game = $null; Steam = $steam }
+    return @{ Game = $null; Steam = $steam; Lib = $null }
 }
 $found = Find-RE7
 if (-not $GameSource) { $GameSource = $found.Game }
@@ -74,6 +74,17 @@ if (-not $NoGameCopy) {
         Fail "Couldn't find Resident Evil 7 in your Steam libraries. Install it from Steam first (or pass -GameSource)."
     }
     Ok "RE7 found: $GameSource"
+}
+# RE7 has two Steam versions: the current ray-tracing (RT) build, and the older DX11 one
+# on the "dx11_non-rt" beta branch. REFramework detects either; coop-re7 is tested on RT.
+if ($found.Lib) {
+    $acf = Join-Path $found.Lib "steamapps\appmanifest_$AppId.acf"
+    if ((Test-Path $acf) -and ((Get-Content $acf -Raw) -match '"BetaKey"\s+"([^"]+)"')) {
+        Warn "Your RE7 is on the Steam beta branch '$($Matches[1])' (the older non-RT version)."
+        Warn "coop-re7 is tested on the current (RT) version. It should work, but if the other player"
+        Warn "doesn't appear, switch RE7 back to 'None' under Properties > Betas in Steam and reinstall."
+        Warn "Both players can be on different versions."
+    }
 }
 
 # ---------------------------------------------------------------- 2. game copy
@@ -171,6 +182,6 @@ if (-not $NoShortcut) {
 
 Write-Host ""
 Write-Host "All done." -ForegroundColor Green
-Write-Host "1. Start Steam, then launch 'Start RE7 Co-op' and load a save in Chapter 1."
-Write-Host "2. Press Insert > Script Generated UI > coop_dummy > Connect."
-Write-Host "3. Copy your SteamID to your friend, paste theirs, click 'Connect to friend'."
+Write-Host "1. Start Steam, then launch 'Start RE7 Co-op' and load a save."
+Write-Host "2. Press Insert. In the RE7 Co-op window, open 'Connect, saving and display'."
+Write-Host "3. Click Connect next to your friend's name; they click Accept."

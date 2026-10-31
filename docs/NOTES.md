@@ -518,3 +518,20 @@ folder, missing sounds for player 2, RT build only.
   fixed it; the single-jump test then **passed** (2026-10-31, bot claims another chapter → Go to my friend's
   chapter → arrived at its start, playable).
 - Fixed: periodic diag in the ghost update indexed `get_player()` while it was nil during a load.
+
+## v0.5: polish (2026-10-31)
+
+- **Names**: REFramework's default ImGui font (1.92, dynamic glyphs with Windows fallbacks) already renders
+  Cyrillic, CJK, kana, Hangul and accents in `draw.text`/`draw.world_text`. Loading Microsoft YaHei with
+  `imgui.load_font` *broke* Hangul (YaHei has none) → reverted. No font change shipped.
+- **Footsteps**: the player has `app.FootEffectController` with `callSE(SETriggerTypeEnum, via.vec3,
+  UInt32 material)`, which plays Ethan's footstep at any position. `SETarget` (Player=0, PlayerJog=1,
+  PlayerCrouch=2) picks the sound set; set it for the ghost's stance and restore. Steps fire per stride
+  travelled by the ghost (walk 0.75 m, jog 1.05 m, crouch 0.6 m), alternating LeftLegContact/RightLegContact,
+  with the local player's `MaterialID`. Heard and confirmed by the owner with the bot.
+- **Non-RT**: the pinned nightly has only a unified `REFramework.zip` (runtime game/TDB detection, DX11 code
+  present), no `RE7_TDB49` asset. The installer reads `appmanifest_418370.acf` for `"BetaKey"` and warns.
+  Not run on non-RT.
+- Research helper `coop_devexec.lua` (test copy only, never in the kit): runs `data/coop_exec.lua` once and
+  writes `coop_exec_out.txt`, so probes run without "Reset scripts". All REFramework autorun scripts share
+  one Lua state, so globals from coop_dummy are visible to it.

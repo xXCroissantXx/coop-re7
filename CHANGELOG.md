@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.5 (2026-10-31)
+- **Footsteps**: you hear your friend's footsteps where they walk, using RE7's own walk, jog and crouch
+  sounds. Switch off with **Friend's footsteps** in the RE7 Co-op window.
+- **Installer**: warns when RE7 is on the older non-RT version (Steam beta `dx11_non-rt`), which is untested;
+  its closing steps now describe the friend list.
+- Checked: Steam names in Russian, Chinese, Japanese and Korean already show correctly on the nameplate and
+  in the friend list.
+
 ## v0.4 (2026-10-31)
 - **Pick your friend from a list**: the RE7 Co-op window lists your Steam friends who are running RE7 Co-op,
   each with a **Connect** button. No more copying SteamIDs (still possible under *Connect with a SteamID

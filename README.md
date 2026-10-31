@@ -1,4 +1,4 @@
-# coop-re7: online co-op for Resident Evil 7 (prototype, v0.4)
+# coop-re7: online co-op for Resident Evil 7 (prototype, v0.5)
 
 Play Resident Evil 7 with a friend over the internet. Each of you sees the other as a full-body **Ethan** who
 walks, jogs, crouches, sidesteps and looks around where they do, over Steam (no port forwarding).
@@ -51,6 +51,7 @@ first). **Teleport to my friend** works once you're within 40 m of them.
 | **Back up saves now** | An extra backup on demand. |
 | **On-screen status** | The top-left status lines (connection, ping, chapter, saving). |
 | **Nameplate over your friend** | Their Steam name above their Ethan. |
+| **Friend's footsteps** | Hear your friend's footsteps where they walk (walk, jog and crouch sounds). |
 | **Go to my friend's chapter** | Jump to the start of the chapter your friend is in. Saving is switched off first. |
 | **Teleport to my friend** | Hop to them when you're within 40 m (same chapter). Further away, walk: RE7 only loads the area around you. |
 | **Show all online friends** | List every online Steam friend; connecting invites them for when they start RE7 Co-op. |
@@ -63,6 +64,8 @@ first). **Teleport to my friend** works once you're within 40 m of them.
 - Only position, movement, stance, looking and chapter are shared. Enemies, items, doors and story are separate.
 - Tested on one PC against a simulated player; a real two-player session (and the invite / Accept step)
   hasn't been verified yet.
+- coop-re7 is tested on RE7's current (ray-tracing) version. The older non-RT version (Steam beta
+  `dx11_non-rt`) should work but hasn't been tried; the installer tells you if you're on it.
 - The chapter jump is a hidden developer feature of RE7: after many jumps in one session it can break (black
   screen, outside the map). Restart the game if that happens.
 
