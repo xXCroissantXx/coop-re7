@@ -1,4 +1,4 @@
-# coop-re7: online co-op for Resident Evil 7 (prototype, v0.10)
+# coop-re7: online co-op for Resident Evil 7 (prototype, v0.11)
 
 Play Resident Evil 7 with a friend over the internet. Each of you sees the other as a full-body **Ethan** who
 walks, jogs, crouches, sidesteps and looks around where they do, over Steam (no port forwarding).
@@ -53,7 +53,7 @@ first). **Teleport to my friend** works once you're within 40 m of them.
 
 | Option | What it does |
 |---|---|
-| **Allow saving** | Off by default: nothing you do is saved. Turn on to save normally. Your save folder is backed up automatically (at every launch and when you turn this on; the last 20 backups are kept in `reframework\data\save_backups`). The co-op copy shares Steam Cloud saves with your normal RE7. |
+| **Allow saving** | Off by default: nothing you do is saved. Turn on to save normally. Your save folder is backed up automatically (at every launch and when you turn this on; the last 20 backups are kept in `reframework\data\save_backups`). The co-op copy shares Steam Cloud saves with your normal RE7. When one of you saves, the other sees "Your friend saved" so you can both save at the same point. |
 | **Back up saves now** | An extra backup on demand. |
 | **On-screen status** | The top-left status lines (connection, ping, chapter, saving). |
 | **Nameplate over your friend** | Their Steam name above their Ethan. |

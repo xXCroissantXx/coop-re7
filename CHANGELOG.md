@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.11 (2026-10-31)
+- **Saving together**: when one player's game saves (tape recorder or autosave, with Allow saving on), the other
+  sees "Your friend saved..." (and is told if their own saving is off), so you can both keep matching saves.
+- **Safer saves**: enemies your game is copying from your friend's get their own AI back while a save is being
+  prepared, so a save can't store them frozen. Following resumes a few seconds later.
+- Not yet tested with a real save (only the notice, with a simulated friend).
+
 ## v0.10 (2026-10-31)
 - **Downed and revive**: with your friend connected, a fatal hit puts you down instead of ending your game. You
   crouch, can't move, and the screen goes black and white, with a 90-second countdown. Your friend sees "Your

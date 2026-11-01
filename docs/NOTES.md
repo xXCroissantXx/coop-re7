@@ -751,3 +751,22 @@ folder, missing sounds for player 2, RT build only.
 - **Full revive test 2026-10-31**: bot set to stay, owner ~4.8 m away, fatal self-hit → down (crouched, no
   control, monochrome; health crept 1 → 81 from regeneration while down). Bot switched to follow, walked the
   trail and stopped 2.6 m away; revived at 21:03:55 (28 s after going down), `up` sent.
+
+## Saving in co-op (2026-10-31)
+
+- The ghost (VrDummyPlayer copies) has no folder and no save component: never saved. Doors/items keep their
+  shared state in saves (intended). Enemy saves (`app.EnemySave`: getSaveData/prepareToSave/setupSaveData;
+  `EnemyStatus.EnemySaveDataClass`: IsUpdate, IsDraw, Health, MaxHealth, Position, Rotation, ThinkState,
+  CommonThinkState) would store a follower's AI-off state.
+- Built: pre-hook on `app.EnemySave.prepareToSave` gives every followed enemy its AI back
+  (`release_for_save`, keeps ownership and timeline) and pauses following for 4 s. Hooks on
+  `SaveDataManager.saveFileMenuRequestExecute` / `saveFileAutoRequestExecute` send `saved menu|auto <ch>` when
+  Allow saving is on; the other side shows "Your friend saved ..." (and says if its own saving is off).
+- Test 2026-10-31 (saving off): bot `saved menu 5` → "Your friend saved at a tape recorder (your saving is
+  off ...)". Save guard still 20/20 + 6/6 + 3/3. A real save (enemy safety, own `saved` event) not tested.
+- Forcing a save for the test didn't work: no tape recorder in the loaded Chapter3 main-house area; autosave
+  zones are `app.TriggerInAction` + `app.GimmickActiveControl` objects under
+  `LevelFsm_c03/LevelFsm_c03_1/AutoSave/c03_1_Main_<progress>` (100_Autosave_DinnerEnd active but
+  `TriggerInSuccessCount` 1, IsLoop false: already fired while saving was blocked; 1100_AutoSave_BeforeHall not
+  active yet). Warping into a zone triggers nothing. `SaveDataManager.saveFileMenuRequest(player)` didn't open
+  the save menu (needs a real recorder). Real-save test still pending.

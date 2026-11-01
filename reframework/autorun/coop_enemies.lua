@@ -447,6 +447,16 @@ local function release(id)
     end
 end
 
+-- For a save: AI back on, but keep the timeline and ownership so following resumes.
+function release_for_save(id)
+    local e = mv.puppets[id]
+    mv.puppets[id] = nil
+    if e then
+        safe(set_brain, e, true)
+        e.cur_bank, e.cur_mid = nil, nil
+    end
+end
+
 local function lerp_angle(a, b, k)
     local d = (b - a + math.pi) % (2 * math.pi) - math.pi
     return a + d * k
@@ -485,6 +495,24 @@ local function drive(e, h, now)
         if math.abs(f - target) > 4 then safe(L.call, L, "set_Frame", target) end
     end
     safe(L.call, L, "set_Speed", s.speed)
+end
+
+-- Saves: an enemy's save data holds its ThinkState and IsUpdate, so a follower saved with
+-- its AI off (requestThinkOff) could load frozen. When the game prepares an enemy for
+-- saving, give every follower its own AI back and pause following for a few seconds;
+-- they're taken over again afterwards.
+local prep = sdk.find_type_definition("app.EnemySave"):get_method("prepareToSave")
+if prep then
+    sdk.hook(prep, function(args)
+        pcall(function()
+            local now = os.clock()
+            if mv.save_pause_until and now < mv.save_pause_until then return end
+            mv.save_pause_until = now + 4
+            local n = 0
+            for id in pairs(mv.puppets) do release_for_save(id) n = n + 1 end
+            if n > 0 then log("saving: gave " .. n .. " followed enemies their AI back") end
+        end)
+    end, function(r) return r end)
 end
 
 -- The friend's position, from their Ethan (only while shown, i.e. data is fresh).
@@ -555,9 +583,11 @@ local function update_movement(now)
         end
     end
     -- Drive the enemies the friend runs; take back the ones they went quiet on.
+    -- Not while a save is being prepared: followers have their own AI back then.
+    local saving = mv.save_pause_until and now < mv.save_pause_until
     for _, e in pairs(es.tracked) do
         local id = e.id
-        if mv.own[id] == "peer" then
+        if mv.own[id] == "peer" and not saving then
             local h = mv.hist[id]
             local fresh = h ~= nil and #h > 0 and now - h[#h].t <= 3
             if fresh then

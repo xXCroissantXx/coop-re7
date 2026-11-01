@@ -163,8 +163,37 @@ local function apply_evend(hash, ch)
     end
 end
 
+-- Saving together. Each player saves their own game; to load matching points later,
+-- both should save at the same moment. When ours really saves (only possible with "Allow
+-- saving" on; the save guard blocks the rest), tell the friend, and show theirs.
+local sdm = sdk.find_type_definition("app.SaveDataManager")
+local function hook_save(method_name, kind)
+    local m = sdm:get_method(method_name)
+    if m == nil then log("save hook missing: " .. method_name) return end
+    sdk.hook(m, function(args)
+        pcall(function()
+            if settings and settings.allow_saving then send(string.format("saved %s %d", kind, chapter())) end
+        end)
+    end, function(r) return r end)
+end
+hook_save("saveFileMenuRequestExecute()", "menu")
+hook_save("saveFileAutoRequestExecute()", "auto")
+
+local function on_saved(kind, ch)
+    local what = kind == "menu" and "Your friend saved at a tape recorder" or "Your friend's game autosaved"
+    if not (settings and settings.allow_saving) then
+        note(what .. " (your saving is off: turn on Allow saving to keep matching saves)")
+    elseif kind == "menu" then
+        note(what .. ": save too so your games match")
+    else
+        note(what)
+    end
+end
+
 -- Called by coop_enemies.lua for every incoming event; true if it was ours.
 function coop_story_on_event(text)
+    local skind, sch = text:match("^saved (%a+) (%-?%d+)")
+    if skind then pcall(on_saved, skind, tonumber(sch)) return true end
     if not sharing() and (text:match("^story ") or text:match("^prog ") or text:match("^evend ")) then
         log("story sharing is off, ignored: " .. text)
         return true
