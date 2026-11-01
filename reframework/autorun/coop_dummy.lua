@@ -1653,6 +1653,9 @@ local function draw_testing()
         imgui.same_line()
         if imgui.button("Bot: hit it for 25%") then enemy_test_msg = enemy_sync_bot_kill_nearest(0.25) end
         if enemy_test_msg then imgui.same_line() imgui.text(enemy_test_msg) end
+        if revive_test_fatal_hit then
+            if imgui.button("Take a fatal hit (you go down; the bot revives you)") then enemy_test_msg = revive_test_fatal_hit() end
+        end
         if story_sync_status then
             imgui.text(story_sync_status())
             if imgui.button("Bot: trigger the next story cutscene") then enemy_test_msg = story_sync_bot_next() end
@@ -2445,6 +2448,10 @@ local function hud_lines()
     if wd then out[#out + 1] = { wd, 0xFF7FE6FF } end
     local sy = story_sync_hud and story_sync_hud()
     if sy then out[#out + 1] = { sy, 0xFF7FE6FF } end
+    if revive_hud then
+        local rt, rc = revive_hud()
+        if rt then out[#out + 1] = { rt, rc } end
+    end
     out[#out + 1] = { settings.allow_saving and "Saving: on (backed up)" or "Saving: off", 0xFFBFBFBF }
     return out
 end

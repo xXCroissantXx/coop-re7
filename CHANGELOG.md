@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.10 (2026-10-31)
+- **Downed and revive**: with your friend connected, a fatal hit puts you down instead of ending your game. You
+  crouch, can't move, and the screen goes black and white, with a 90-second countdown. Your friend sees "Your
+  friend is down!" with the distance; when they stand next to you for 3 seconds you get back up with 35% health.
+  Both down, or nobody coming in 90 seconds, is a normal game over. Playing alone, nothing changes.
+- Testing: "Take a fatal hit" button; the follow-me bot can revive you.
+
 ## v0.9 (2026-10-31)
 - **Shared story** (early): when one player reaches a story cutscene, the other player's game plays the same
   one (started by name; you're pulled into the scene wherever you are). Story progress and finished story

@@ -728,3 +728,26 @@ folder, missing sounds for player 2, RT build only.
   `Process` 3 even on a fresh jump. A full game restart clears GameFlowFsmManager; the first jump of a
   session (progress 0) plays the dinner normally. Story tests that push progress numbers need a restart after.
 - After a full restart and one Chapter3 jump, the dinner played and the owner had control again.
+
+## Player deaths (research 2026-10-31)
+
+- `app.PlayerDamageController` (DamageController): `canDie(DamageInfo)`, `isEnableDieByDamageInfo(DamageInfo)`,
+  `get_isEnableDie`, `doDie(DamageRecord)`, `add_DieHandler(Action)`, `playDeadMotion(DamageInfo)`,
+  `playBlowDeadMotion(dir)`, `get_isLegCutDead`; `app.PlayerStatus.get_IsDead/IsDeadInternal/IsDeadAction`.
+  Game over: `GameManager.setGameOverFlag(bool)`, `isGameOver`, `checkGameOver`, `gameOverUpdate`,
+  `setGameOverPauseFlag`; screen `app.GameOverScreen`. Hooking `canDie` (return false) is the likely place
+  to stop a death in co-op.
+- **coop_revive.lua built**: pre-hooks on `PlayerDamageController.isEnableDieByDamageInfo` and
+  `DamageController.canDie` (player only, by address) return false (SKIP_ORIGINAL + retval 0) when a friend is
+  with us; the player is held in place (warp) on 1 health; friend within 2.8 m for 3 s → health 35%. Both down,
+  90 s alone, or the friend's `gameover` while down → a real death (`allow_death`, a self-hit). Events
+  `down <ch>`, `up`, `gameover`.
+- **Test 2026-10-31** (follow-me bot 2.5 m away): fatal self-hit 985 → health 1, not dead, `down` sent; 3 s
+  later back up at 350/1000, `up` sent, no game over. Bot `down` → "Your friend is down! ... (2 m away)";
+  bot `up` cleared it. Both-down and timeout paths untested.
+- Downed look: `PlayerOrder.setReserveProne()` did nothing visible; `PlayerMovement.set_isCrouch(true)`
+  (crouchRate 1.0, the owner's view dropped) + `PlayerOrder.switchPlayerOperatable(false, Base=0)` +
+  `setDamageGUIMonochrome(true)` does; all reversed on revive/death. Re-applied each frame if the crouch drops.
+- **Full revive test 2026-10-31**: bot set to stay, owner ~4.8 m away, fatal self-hit → down (crouched, no
+  control, monochrome; health crept 1 → 81 from regeneration while down). Bot switched to follow, walked the
+  trail and stopped 2.6 m away; revived at 21:03:55 (28 s after going down), `up` sent.

@@ -1,4 +1,4 @@
-# coop-re7: online co-op for Resident Evil 7 (prototype, v0.9)
+# coop-re7: online co-op for Resident Evil 7 (prototype, v0.10)
 
 Play Resident Evil 7 with a friend over the internet. Each of you sees the other as a full-body **Ethan** who
 walks, jogs, crouches, sidesteps and looks around where they do, over Steam (no port forwarding).
@@ -8,7 +8,8 @@ and **enemies** (early): each enemy is run by the game of the player nearest to 
 other game, and damage and deaths are shared; **doors** (unlocking and opening) and **supplies** (ammo, healing,
 materials picked up by one player vanish for the other; keys, files and maps stay for both).
 and the **story** (early): when one player reaches a story cutscene, the other player's game plays it too, and
-story progress is copied (it only ever moves forward).
+story progress is copied (it only ever moves forward). And **deaths**: a fatal hit puts you down instead, until your
+friend stands next to you for 3 seconds.
 **Not shared yet:** item boxes.
 
 Made with [coop-anything](https://github.com/cranebeaker/coop-anything). MIT licensed.
@@ -74,6 +75,10 @@ first). **Teleport to my friend** works once you're within 40 m of them.
   but get back up as usual. Handovers between two real games are untested.
 - Doors and items: unlocks, door openings and supply pickups are shared (same chapter). Key items, files and
   maps stay in both worlds so nobody gets stuck. Item boxes are separate.
+- Deaths: with your friend connected, a fatal hit puts you **down** (crouched, can't move, black and white)
+  for up to 90 seconds; your friend standing next to you for 3 seconds gets you back up with 35% health. If you
+  are both down, or nobody comes in time, it's a normal game over. Solo and in cutscenes, deaths are unchanged.
+  The "both down" and 90-second paths haven't been tested yet.
 - Story (early): cutscenes are shared by name and progress numbers are copied forward. Tested on one PC only.
   If a cutscene ever hangs and you can't move, restart the game and load again (saving is off by default, so
   nothing is lost). Turn off **Share story** if shared scenes cause trouble.

@@ -207,6 +207,7 @@ local function on_event(text)
     -- Doors and items belong to coop_world.lua.
     if coop_world_on_event and coop_world_on_event(text) then return end
     if coop_story_on_event and coop_story_on_event(text) then return end
+    if coop_revive_on_event and coop_revive_on_event(text) then return end
     local oid, och, oname = text:match("^own (%S+) (%-?%d+) (%S+)")
     if oid then if enemy_move_on_own then enemy_move_on_own(oid, tonumber(och), oname) end return end
     local did, dch, damt, dname = text:match("^dmg (%S+) (%-?%d+) ([%d%.]+) (%S+)")
