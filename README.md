@@ -1,12 +1,13 @@
-# coop-re7: online co-op for Resident Evil 7 (prototype, v0.7)
+# coop-re7: online co-op for Resident Evil 7 (prototype, v0.8)
 
 Play Resident Evil 7 with a friend over the internet. Each of you sees the other as a full-body **Ethan** who
 walks, jogs, crouches, sidesteps and looks around where they do, over Steam (no port forwarding).
 
 **What's shared today:** where each player is and what they're doing (movement, stance, looking, which chapter),
 and **enemies** (early): each enemy is run by the game of the player nearest to it and follows along in the
-other game, and damage and deaths are shared.
-**Not shared yet:** items, doors and story. Each player plays their own copy of the world.
+other game, and damage and deaths are shared; **doors** (unlocking and opening) and **supplies** (ammo, healing,
+materials picked up by one player vanish for the other; keys, files and maps stay for both).
+**Not shared yet:** story progress and cutscenes, item boxes. Each player still plays their own copy of the story.
 
 Made with [coop-anything](https://github.com/cranebeaker/coop-anything). MIT licensed.
 
@@ -67,7 +68,9 @@ first). **Teleport to my friend** works once you're within 40 m of them.
 - Enemies (early, same chapter only): each enemy is run by one game (the nearest player's) and copied in the
   other; it changes hands when the other player gets clearly closer. The copy doesn't show what the enemy is
   holding, and your friend's shots don't make it flinch on your screen. Bosses and Jack go down on both screens
-  but get back up as usual. Items, doors and story are separate. Handovers between two real games are untested.
+  but get back up as usual. Handovers between two real games are untested.
+- Doors and items: unlocks, door openings and supply pickups are shared (same chapter). Key items, files and
+  maps stay in both worlds so nobody gets stuck. Item boxes and story progress are separate.
 - Tested on one PC against a simulated player; a real two-player session (and the invite / Accept step)
   hasn't been verified yet.
 - coop-re7 is tested on RE7's current (ray-tracing) version. The older non-RT version (Steam beta

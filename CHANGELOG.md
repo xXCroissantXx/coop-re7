@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.8 (2026-10-31)
+- **Shared doors**: a door unlocked in one game (with a key, or a one-way door from the other side) unlocks in
+  the other; a door pushed open swings open on the other player's screen too.
+- **Shared supplies**: ammo, healing items, crafting materials and weapons picked up by one player disappear
+  from the other player's world (also in areas they reach later). Keys, files and maps stay in both worlds, so
+  nobody gets stuck without a key.
+- Testing: the bot can open the nearest door, unlock the nearest locked door, or take the nearest supply.
+
 ## v0.7 (2026-10-31)
 - **Enemy movement** (early): each enemy is run by the game of the player nearest to it; the other game turns
   that enemy's own AI off and has it follow the running game (position and animation, 10 updates a second).

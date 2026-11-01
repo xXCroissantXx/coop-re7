@@ -110,6 +110,9 @@ local function send_event(text)
     log("sent: " .. text)
 end
 
+-- Shared with coop_world.lua (doors and items): one event file, one id sequence.
+function coop_send_event(text) send_event(text) end
+
 local function note(msg)
     es.last_msg, es.msg_t = msg, os.clock()
     log(msg)
@@ -201,6 +204,8 @@ local function on_damage(id, ch, amount, name)
 end
 
 local function on_event(text)
+    -- Doors and items belong to coop_world.lua.
+    if coop_world_on_event and coop_world_on_event(text) then return end
     local oid, och, oname = text:match("^own (%S+) (%-?%d+) (%S+)")
     if oid then if enemy_move_on_own then enemy_move_on_own(oid, tonumber(och), oname) end return end
     local did, dch, damt, dname = text:match("^dmg (%S+) (%-?%d+) ([%d%.]+) (%S+)")

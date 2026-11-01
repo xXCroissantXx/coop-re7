@@ -1650,6 +1650,14 @@ local function draw_testing()
         imgui.same_line()
         if imgui.button("Bot: hit it for 25%") then enemy_test_msg = enemy_sync_bot_kill_nearest(0.25) end
         if enemy_test_msg then imgui.same_line() imgui.text(enemy_test_msg) end
+        if world_sync_status then
+            imgui.text(world_sync_status())
+            if imgui.button("Bot: open nearest door") then enemy_test_msg = world_sync_bot("open") end
+            imgui.same_line()
+            if imgui.button("Bot: unlock nearest locked door") then enemy_test_msg = world_sync_bot("unlock") end
+            imgui.same_line()
+            if imgui.button("Bot: take nearest supply") then enemy_test_msg = world_sync_bot("took") end
+        end
         if enemy_move_status then
             imgui.text(enemy_move_status())
             if imgui.button("Record nearest enemy (6 s)") then enemy_test_msg = enemy_move_record(6) end
@@ -2426,6 +2434,8 @@ local function hud_lines()
     end
     local em = enemy_sync_hud and enemy_sync_hud()
     if em then out[#out + 1] = { em, 0xFF7FE6FF } end
+    local wd = world_sync_hud and world_sync_hud()
+    if wd then out[#out + 1] = { wd, 0xFF7FE6FF } end
     out[#out + 1] = { settings.allow_saving and "Saving: on (backed up)" or "Saving: off", 0xFFBFBFBF }
     return out
 end

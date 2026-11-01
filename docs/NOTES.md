@@ -646,3 +646,29 @@ folder, missing sounds for player 2, RT build only.
 - **One-PC test 2026-10-31 (Jack)**: hand to the bot → FSM off, own=peer; 3 s later taken back (FSM on,
   own=me). Hand to the bot, then bot's `own` event → released at once, "your friend handed Em3000 to you".
   Real handovers between two games untested.
+
+## Doors and items (2026-10-31)
+
+- **Doors**: `app.DoorPush` (is_a `app.Door`; 8 in the Chapter3 main house 1F/2F, found with
+  `scene:findComponents(app.DoorPush)`), each with `SaveGUID` (unique), `get_isLocked`, `get_doorState`
+  (0 closed, 1 locked, 2 little open, 3 pushed, 4 auto-open, 5 opened, 6 auto-close), `get_currentAngle`,
+  `unlockDoor()`, `requestAutoOpen(OpenSide)` (Auto = 2 → swung to 90°, state 5), `requestClosed(bool)`.
+  Also `Fsm`, `FsmStateTracker`, `MapDoor` on the same object. Key doors are pairs (L and R halves).
+- **Items**: `app.Item` (42-58 in the area; ObjectManager list 3 here), `SaveGUID`, `ItemDataID`
+  ("ShotgunBullet", "Herb", "3CrestKeyA"...), `get_ItemData().Category` (ItemCategoryType: 0 Other, 1 Weapon,
+  2 Shell, 3 Drug, 4 KeyItem, 5 File, 6 Map, 7 Material, 8 StackWeapon, 9 UsableKeyItem, 10
+  DiscardableKeyItem (coins, lockpicks, car key), 11 SupplyBox). Pickup = `changeStateInventoryIn(GameObject)`
+  (hooked); `disableFromScene()` hides it (Draw/Update false, state 6) without touching any inventory.
+- **coop_world.lua**: shares the reliable event channel via `coop_send_event` / `coop_world_on_event`.
+  `unlock <id> <ch>`, `open <id> <ch>` (states 3-5 only, not the approach creak), `took <id> <ch> <name>`
+  for supplies (category not 4/5/6/9/10); key items stay in both worlds. Took-events for unloaded items are
+  remembered and applied when the item appears. Doors/items found every 3 s / 2 s, doors polled 4x a second.
+- **Bot test 2026-10-31**: bot `open` → a closed door swung open (state 5); bot `unlock` → the left key-door
+  half unlocked, "your friend unlocked a door"; bot `took` → a Herb vanished, "your friend took Herb". No
+  echoes (sent 0). Own pickups not yet tested.
+- Own pickups: a hook on `app.Item.changeStateInventoryIn` never fired when the owner picked up handgun ammo.
+  The world item went `getItemState` 0 → 6 (hidden, like `disableFromScene`) and a separate inventory Item
+  appeared (`wp1011_HandgunBullet_Item`, state 2). Now detected by polling world items for 0 → 6 (4x a
+  second), skipping ones hidden on the friend's word. Own door push: `open` sent (5c8bdf4a-...).
+- Own pickup via the state poll, 2026-10-31: `sent: took 3ff9028b-... 5 HandgunBullet`. Door and item sync
+  checked both ways on one PC.
