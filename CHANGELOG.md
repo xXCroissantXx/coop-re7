@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.9 (2026-10-31)
+- **Shared story** (early): when one player reaches a story cutscene, the other player's game plays the same
+  one (started by name; you're pulled into the scene wherever you are). Story progress and finished story
+  events are copied, and progress only ever moves forward. Each cutscene plays once per side; the list of
+  played cutscenes survives script resets, so a finished scene is never replayed.
+- **Share story** switch in the RE7 Co-op window (on by default) to turn it off.
+- Testing: the bot can trigger the next story cutscene in your area.
+
 ## v0.8 (2026-10-31)
 - **Shared doors**: a door unlocked in one game (with a key, or a one-way door from the other side) unlocks in
   the other; a door pushed open swings open on the other player's screen too.

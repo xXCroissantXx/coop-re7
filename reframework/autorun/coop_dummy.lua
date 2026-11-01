@@ -1505,6 +1505,9 @@ local function draw_connect_body()
     imgui.same_line()
     local fchanged, fv = imgui.checkbox("Friend's footsteps", settings.footsteps ~= false)
     if fchanged then settings.footsteps = fv save_settings() end
+    -- Story cutscenes and progress follow whichever player reaches them first.
+    local sc, sv = imgui.checkbox("Share story (cutscenes and progress)", settings.share_story ~= false)
+    if sc then settings.share_story = sv save_settings() end
     if imgui.button("Teleport to my friend") then teleport_to_friend() end
 end
 
@@ -1650,6 +1653,10 @@ local function draw_testing()
         imgui.same_line()
         if imgui.button("Bot: hit it for 25%") then enemy_test_msg = enemy_sync_bot_kill_nearest(0.25) end
         if enemy_test_msg then imgui.same_line() imgui.text(enemy_test_msg) end
+        if story_sync_status then
+            imgui.text(story_sync_status())
+            if imgui.button("Bot: trigger the next story cutscene") then enemy_test_msg = story_sync_bot_next() end
+        end
         if world_sync_status then
             imgui.text(world_sync_status())
             if imgui.button("Bot: open nearest door") then enemy_test_msg = world_sync_bot("open") end
@@ -2436,6 +2443,8 @@ local function hud_lines()
     if em then out[#out + 1] = { em, 0xFF7FE6FF } end
     local wd = world_sync_hud and world_sync_hud()
     if wd then out[#out + 1] = { wd, 0xFF7FE6FF } end
+    local sy = story_sync_hud and story_sync_hud()
+    if sy then out[#out + 1] = { sy, 0xFF7FE6FF } end
     out[#out + 1] = { settings.allow_saving and "Saving: on (backed up)" or "Saving: off", 0xFFBFBFBF }
     return out
 end

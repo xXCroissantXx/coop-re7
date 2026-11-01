@@ -1,4 +1,4 @@
-# coop-re7: online co-op for Resident Evil 7 (prototype, v0.8)
+# coop-re7: online co-op for Resident Evil 7 (prototype, v0.9)
 
 Play Resident Evil 7 with a friend over the internet. Each of you sees the other as a full-body **Ethan** who
 walks, jogs, crouches, sidesteps and looks around where they do, over Steam (no port forwarding).
@@ -7,7 +7,9 @@ walks, jogs, crouches, sidesteps and looks around where they do, over Steam (no 
 and **enemies** (early): each enemy is run by the game of the player nearest to it and follows along in the
 other game, and damage and deaths are shared; **doors** (unlocking and opening) and **supplies** (ammo, healing,
 materials picked up by one player vanish for the other; keys, files and maps stay for both).
-**Not shared yet:** story progress and cutscenes, item boxes. Each player still plays their own copy of the story.
+and the **story** (early): when one player reaches a story cutscene, the other player's game plays it too, and
+story progress is copied (it only ever moves forward).
+**Not shared yet:** item boxes.
 
 Made with [coop-anything](https://github.com/cranebeaker/coop-anything). MIT licensed.
 
@@ -55,6 +57,7 @@ first). **Teleport to my friend** works once you're within 40 m of them.
 | **On-screen status** | The top-left status lines (connection, ping, chapter, saving). |
 | **Nameplate over your friend** | Their Steam name above their Ethan. |
 | **Friend's footsteps** | Hear your friend's footsteps where they walk (walk, jog and crouch sounds). |
+| **Share story (cutscenes and progress)** | On by default. When either of you reaches a story cutscene, the other's game plays it too (you're pulled into the scene wherever you are). Turn off if a shared scene goes wrong. |
 | **Go to my friend's chapter** | Jump to the start of the chapter your friend is in. Saving is switched off first. |
 | **Teleport to my friend** | Hop to them when you're within 40 m (same chapter). Further away, walk: RE7 only loads the area around you. |
 | **Show all online friends** | List every online Steam friend; connecting invites them for when they start RE7 Co-op. |
@@ -70,7 +73,10 @@ first). **Teleport to my friend** works once you're within 40 m of them.
   holding, and your friend's shots don't make it flinch on your screen. Bosses and Jack go down on both screens
   but get back up as usual. Handovers between two real games are untested.
 - Doors and items: unlocks, door openings and supply pickups are shared (same chapter). Key items, files and
-  maps stay in both worlds so nobody gets stuck. Item boxes and story progress are separate.
+  maps stay in both worlds so nobody gets stuck. Item boxes are separate.
+- Story (early): cutscenes are shared by name and progress numbers are copied forward. Tested on one PC only.
+  If a cutscene ever hangs and you can't move, restart the game and load again (saving is off by default, so
+  nothing is lost). Turn off **Share story** if shared scenes cause trouble.
 - Tested on one PC against a simulated player; a real two-player session (and the invite / Accept step)
   hasn't been verified yet.
 - coop-re7 is tested on RE7's current (ray-tracing) version. The older non-RT version (Steam beta

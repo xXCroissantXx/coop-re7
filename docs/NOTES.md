@@ -672,3 +672,59 @@ folder, missing sounds for player 2, RT build only.
   second), skipping ones hidden on the friend's word. Own door push: `open` sent (5c8bdf4a-...).
 - Own pickup via the state poll, 2026-10-31: `sent: took 3ff9028b-... 5 HandgunBullet`. Door and item sync
   checked both ways on one PC.
+
+## Story and cutscenes research (started 2026-10-31)
+
+- `app.GameFlowFsmManager.GameFlowKindEnum` splits chapters into story stages: C00_Main, C01_Main,
+  C03_1..C03_5_Main (main house), C04_1..C04_3_Main, FF000/030/040/050_Main, C07_1..C07_4_Main, C08_Main,
+  C03_IMD_Main, C09_Main. A finer progress marker than `_CurrentChapter`; runtime state not read yet.
+- Cutscenes: `app.GameEventController` (RunningEventControllers on `_GameEventMan`), each with a
+  `GameEventSetting` (`get_eventSetting`) and `GameEventTask`; start/end handlers exist (`add_StartHandler`,
+  `add_EndHandler`). No skip API.
+- `app.GameFlowFsmManager` (singleton): `CurrentMainGameFlow`, `setCurrentFlow(string)`, progress numbers
+  per flow keyed by a uint32 hash: `setProgressiveNo(hash, int)`, `jumpProgressiveNo(hash, int)`,
+  `getProgressiveNo(hash|string|Guid)` → via.userdata.Variable; `sendEventEnded(hash)`, `isEventEnded(hash)`,
+  `sendBattleEnded(hash)`; dictionaries `Flows`, `Gimmicks`, lists `EventEnd`, `BattleEnd`.
+- Cutscenes: `GameEventController.requestSetup(GameEventSetting, Transform)`; `GameEventSetting.get_eventName`
+  gives names like `c03e00_00` (chapter 3 event 00 part 00). `onEndHandler(GameObject, bool)` fires once per
+  object taking part (Pl0000, Em3000, doors, props).
+- **Logged 2026-10-31, Chapter3 jump + dinner + a few minutes of play**: load sets flows c03_1..c03_5 and
+  progress 0 on five hashes (2c60d2ac, 43faffd1, 2e2d3671, 9fb77189, 69442936); dinner = cutscenes
+  c03e00_00 → c03e00_01 → c03e00_02; then `sendEventEnded 9fb77189` and progress on flow 9fb77189 went
+  100 → 200 → 300 → 400 as the owner followed the objective (one step per story beat). A title-screen intro
+  c00e00_00 ran under flow c00_Main in between (the jump passes through it).
+- So story position = (flow hash, progress value) pairs plus "event ended" hashes; cutscenes have stable
+  names. Next experiments: what `jumpProgressiveNo`/`setProgressiveNo` do to a game that's behind (world
+  state, gimmicks), and whether a named cutscene can be started on the other side.
+- **`jumpProgressiveNo(9fb77189, 500)` changed only the number** (owner unpaused and played 30 s: no new
+  objective, event or world change). Progress numbers record the story; triggers (areas, items, cutscene ends)
+  drive it.
+- **Starting a named cutscene works**: `GameManager._GameEventMan` (`app.GameEventManager`) has
+  `requestEvent(String name, Transform, Boolean)`, `isSameEventRequested(String)`,
+  `requestEventFromOtherEvent(String, Transform, String)`. 41 GameEventSettings were loaded in the Chapter3
+  main house (c03e00_00..02, c03e01_00..02, c03e02_00/10, c03e03_00/01, Jack's em3000_* moves, door kicks,
+  interact actions). `requestEvent("c03e01_00", nil, false)` started that story cutscene at once (the deputy
+  at the window), out of order.
+- Story-sync design (one player leads): mirror story cutscenes by name (`c\d\de\d\d_\d\d`) from the game that
+  triggers them (hook `GameEventController.requestSetup`), play each once per side (`requestEvent`), and copy
+  progress numbers (`setProgressiveNo`) and ended events so later triggers line up. The follower's player is
+  pulled into the scene wherever they are.
+- **coop_story.lua built** (events `story <name> <ch>`, `prog <hash> <value> <ch>`, `evend <hash> <ch>` via the
+  shared reliable channel; hooks on GameEventController.requestSetup, setProgressiveNo, sendEventEnded).
+  Bot test 2026-10-31: bot `story c03e00_00` → played in the owner's game ("your friend's story"), not echoed;
+  bot `prog 9fb77189 600` → 500 → 600; a later `prog ... 300` left it at 600 (never backwards). Own sends
+  not yet confirmed.
+- **Hung-cutscene recovery 2026-10-31**: after Reset scripts emptied the played list, the bot's `story
+  c03e00_00` replayed the already-finished dinner; its controller hung (`Process` 3), the owner couldn't
+  move, and `requestEvent("c03e00_02")` didn't help. A chapter jump queued by `jump_to_chapter` didn't fire
+  while the event ran. `RunningEventControllers[0].EventTask:doTerminate()` cleared the running event
+  (`local_cutscene` false) but the player stayed locked; a direct `chapterJumpRequest("Chapter3_Start")`
+  then reloaded the chapter (respawn 20:48:55) and the dinner played normally. Fix: the played list is now
+  kept in `coop_story_played.json` per chapter, so a finished cutscene is never replayed on the friend's word.
+- On chapter load the game calls `setProgressiveNo` 100→400 for 9fb77189 at once (restoring progress); these
+  go out as `prog` events (harmless: the other side only moves forward).
+- **Chapter jumps keep the story progress of the session.** After the jump, the game restored 9fb77189 to
+  100→400 (and this session had been pushed to 500/600 by tests); the dinner c03e00_00 then hung at
+  `Process` 3 even on a fresh jump. A full game restart clears GameFlowFsmManager; the first jump of a
+  session (progress 0) plays the dinner normally. Story tests that push progress numbers need a restart after.
+- After a full restart and one Chapter3 jump, the dinner played and the owner had control again.
