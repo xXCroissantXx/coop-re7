@@ -1,9 +1,14 @@
--- coop_enemies.lua: enemy sync, step 1 (deaths).
--- When an enemy dies (or Jack is knocked down) in one player's game, the same enemy
--- goes down in the other's. Events travel reliably through CoopNet.cs:
+-- coop_enemies.lua: shared enemies, and the reliable event channel the other co-op
+-- scripts use.
+-- Deaths and damage: when an enemy dies (or Jack is knocked down) or loses health in one
+-- player's game, the same enemy does in the other's. Movement: each enemy is run by the
+-- game of the nearest player and followed in the other (see "Enemy movement" below).
+-- Events travel reliably through CoopNet.cs:
 --   us -> coopnet_ev_out.txt   "<id>\t<text>" lines, ids always growing
 --   friend -> coopnet_ev_in.txt "<n>\t<text>" lines, each n handled once
--- Event text: "kill <enemy id> <chapter> <name>".
+-- Ours: "kill <enemy id> <chapter> <name>", "dmg <id> <chapter> <amount> <name>",
+-- "own <id> <chapter> <name>". coop_world, coop_story and coop_revive send through
+-- coop_send_event and get theirs via coop_*_on_event (see on_event).
 --
 -- Enemy id: regular enemies (and Jack) carry app.EnemySave.SaveGUID, saved in the
 -- level, so it's the same on both PCs. Others fall back to "folder path/name".

@@ -1,7 +1,10 @@
--- coop_dummy.lua: spawn RE7's own VR dummy-player body (Prefab/System/VrDummyPlayer.pfb,
--- held by app.vr.VrManager.DummyPlayerPrefab) 2 m from the player as a ghost
--- candidate, label it, and log its full hierarchy and components.
--- Log: <game>/reframework/data/coop_dummy_log.txt
+-- coop_dummy.lua: the other player's Ethan, and the co-op UI.
+-- Builds the friend's body from RE7's VR dummy-player prefab
+-- (Prefab/System/VrDummyPlayer.pfb, app.vr.VrManager.DummyPlayerPrefab) dressed in the
+-- player's own Shadow* meshes, animates it from the network samples (walk/jog/crouch,
+-- head look, footsteps), rebuilds it after loads, and owns the RE7 Co-op window, the
+-- on-screen status, connecting, the chapter switcher and the testing tools.
+-- Log: <game>/reframework/data/coop_dummy_log.txt (plus one copy per script load).
 
 -- One log file per script load, so a Reset scripts doesn't wipe the last test.
 local lines = {}

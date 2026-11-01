@@ -1,10 +1,10 @@
 // CoopNet.cs: RE7 co-op transport (REFramework C# source plugin).
 //
-// Moves player-state samples between two game instances over UDP. It touches no
-// game API: the Lua side (coop_dummy.lua) writes the local player's state to
-// reframework/data/coopnet_out.txt and reads the peer's samples from
-// reframework/data/coopnet_in.txt. That file bridge is a stopgap until the
-// ghost is driven from C# directly.
+// Moves player state, events and enemy snapshots between two game instances. It
+// touches no game API: the Lua scripts write what to send into reframework/data
+// files and read what arrived from others (coopnet_out/in, coopnet_ev_out/in,
+// coopnet_es_out/in), plus coopnet_command.txt for UI commands, coopnet_status.txt
+// and coopnet_friends.txt for the window. It also makes the save backups.
 //
 // Modes (reframework/data/coopnet_config.json):
 //   "echo":  send to our own socket on 127.0.0.1, so the ghost replays us
@@ -12,10 +12,17 @@
 //   "udp":   send to peerHost:peerPort. Needs a reachable port.
 //   "steam": send to peerSteamId over Valve's relay (ISteamNetworkingMessages,
 //            P/Invoked from the game's own steam_api64.dll). No port forwarding.
+//   "bot":   a simulated friend (follow me / circle / stay) through the normal
+//            receive path, with latency, jitter and loss. For testing alone.
 //
-// Packet (64 bytes, little endian):
-//   "R7C2" | u32 seq | f64 senderTime | f32 px py pz | f32 qx qy qz qw
-//   | u32 animBank | u32 animId | f32 animFrame | f32 lookYaw lookPitch
+// Packets:
+//   "R7C2" player state, 64 bytes, little endian, ~30 a second, unreliable:
+//     u32 seq | f64 senderTime | f32 px py pz | f32 qx qy qz qw
+//     | u32 stance flags | u32 chapter | f32 ping echo | f32 lookYaw lookPitch
+//   "R7E1" + UTF-8 text: one-off events (kills, doors, pickups, cutscenes, down/up),
+//     reliable; coopnet_ev_out.txt / coopnet_ev_in.txt.
+//   "R7S1" + UTF-8 text: enemy snapshots, ~10 a second, unreliable, newest wins;
+//     coopnet_es_out.txt / coopnet_es_in.txt.
 
 using System;
 using System.Collections.Generic;
